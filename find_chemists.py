@@ -242,8 +242,8 @@ def is_unwanted_pharmacy_entity(place_or_name) -> Tuple[bool, str]:
         return True, "Keyword: Doctor/Physician/Surgeon"
     if re.search(r"\b(prof\.|professor)\s*dr\b", name_lower):
         return True, "Keyword: Prof. Dr."
-    if re.search(r"\bdr\.?\s*[a-z]", name_lower):
-        if any(b in name_lower for b in ["morepen", "tabscience", "dr.generics", "dr generics"]):
+    if re.search(r"\b(dr\.\s*[a-z]|dr\s+[a-z])", name_lower):
+        if any(b in name_lower for b in ["morepen", "tabscience", "dr.generics", "dr generics", "dr. pharmacy", "dr pharmacy", "dr. chemist", "dr chemist"]):
             pass
         elif re.search(r"\b(road|rd|nagar|colony|marg|salai|nedunsalai|rasta|gali|bazaar|bazar|market|street|st|circle|cross|layout|block|sector)\b", name_lower) and any(k in name_lower for k in ["medplus", "apollo pharmacy", "wellness forever", "zeelab", "pharmacy", "chemist", "medical store", "medicals"]):
             pass
