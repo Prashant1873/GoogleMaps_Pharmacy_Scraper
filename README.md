@@ -9,7 +9,7 @@ Built with persistent caching, adaptive radius expansion, walking route calculat
 ## 🌟 Key Features
 
 - **Accurate Geocoding**: Intelligently cleans and normalizes doctor clinic/hospital addresses, city, and pincodes to resolve precise geographic coordinates (Latitude / Longitude).
-- **Adaptive Walking Proximity Search**: Uses Google Places API Nearby Search starting at a localized 300m walking radius, dynamically expanding (up to 3,000m) to guarantee up to 5 valid pharmacy candidates per doctor.
+- **Multi-Tier Adaptive Proximity Search**: Uses Google Places API Nearby Search starting at a localized 300m walking radius, dynamically expanding in tiers (`300m -> 800m -> 1,500m -> 2,500m -> 3,500m -> 5,000m -> 7,500m -> 10,000m`) to guarantee up to 5 valid pharmacy candidates per doctor.
 - **True Walking Distance & Duration**: Calculates realistic pedestrian walking route distances (meters) and transit times (minutes) using the Google Distance Matrix API (`mode=walking`).
 - **Zero-Redundancy SQLite Cache**: Caches all API responses (Geocodes, Places searches, and Distance Matrix elements) in a local SQLite database (`cache.db`). Re-runs execute in seconds with 0 additional API calls.
 - **Cost-Optimized & Free-Tier Friendly**: Drastically cuts API billing overhead and generates an instant cost-estimation summary report.
@@ -105,8 +105,9 @@ python run_pipeline.py --input All_doctors.xlsx --output final_doctor_nearest_5_
 | `--input` | Path to the source Excel file containing doctor addresses | `All_doctors.xlsx` |
 | `--output` | Output filename for the final matched Excel report | `final_doctor_nearest_5_chemists.xlsx` |
 | `--radius` | Initial search radius in meters (walking distance) | `300` |
-| `--limit` | Target number of nearest pharmacies to find per doctor | `5` |
-| `--no-cache` | Disable SQLite caching and force fresh API queries | `False` |
+| `--max-radius` | Maximum search radius in meters to expand until target chemists found | `10000` |
+| `--target-count`| Target number of nearest pharmacies to find per doctor | `5` |
+| `--limit` | Optional limit on number of doctors to process | `None` (all) |
 
 ---
 

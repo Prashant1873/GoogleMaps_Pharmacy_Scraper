@@ -489,6 +489,18 @@ class GoogleMapsClient:
         return results
 
 
+def get_adaptive_radius_steps(base_radius: int = 300, max_radius: int = 10000) -> List[int]:
+    """Generates an expanding ladder of search radius thresholds up to max_radius."""
+    tiers = [300, 800, 1500, 2500, 3500, 5000, 7500, 10000]
+    steps = [base_radius]
+    for t in tiers:
+        if t > base_radius and t <= max_radius:
+            steps.append(t)
+    if max_radius not in steps and max_radius > base_radius:
+        steps.append(max_radius)
+    return sorted(list(set(steps)))
+
+
 # ---------------------------------------------------------
 # Core Matching Engine with Adaptive Search
 # ---------------------------------------------------------
@@ -496,11 +508,11 @@ def find_top_pharmacies_for_doctor(
     doc_row: pd.Series,
     client: GoogleMapsClient,
     base_radius: int = 300,
-    max_radius: int = 1500,
+    max_radius: int = 10000,
     target_count: int = 5,
     mode: str = "walking"
 ) -> List[Dict[str, Any]]:
-    """Finds and ranks top 5 pharmacies for a single doctor using smart adaptive radius."""
+    """Finds and ranks top pharmacies for a single doctor using multi-tier smart adaptive radius."""
     doc_id = doc_row.get("Doc ID", "")
     doc_name = doc_row.get("DOCTOR NAME", "")
     doc_address = doc_row.get("Address", "")
@@ -515,11 +527,11 @@ def find_top_pharmacies_for_doctor(
 
     origin_lat, origin_lng = geo["lat"], geo["lng"]
 
-    # 2. Smart Adaptive Search (300m -> 800m -> 1500m)
-    current_radius = base_radius
+    # 2. Multi-Tier Smart Adaptive Search (expands until target_count chemists are found)
+    radius_steps = get_adaptive_radius_steps(base_radius=base_radius, max_radius=max_radius)
     candidates: Dict[str, Dict[str, Any]] = {}
 
-    while current_radius <= max_radius:
+    for current_radius in radius_steps:
         raw_places = client.search_nearby_pharmacies(origin_lat, origin_lng, radius=current_radius)
         for place in raw_places:
             # Filter non-pharmacy entities (clinics, doctors, labs, diagnostics, surgicals, enterprises, banking, gyms, pets, ayurveda, etc.)
@@ -534,37 +546,30 @@ def find_top_pharmacies_for_doctor(
         if len(candidates) >= target_count:
             break
 
-        # Expand radius if sparse
-        if current_radius == base_radius:
-            current_radius = 800
-        elif current_radius == 800:
-            current_radius = 1500
-        else:
-            break
-
     if not candidates:
         logger.info(f"No pharmacies found for Doctor {doc_id} within {max_radius}m.")
         return []
 
-    # 3. Pre-rank candidates by Haversine distance and take top 10 for Distance Matrix
+    # 3. Pre-rank candidates by Haversine distance and take candidate pool for Distance Matrix
     candidate_list = list(candidates.values())
     for c in candidate_list:
         c_loc = c["geometry"]["location"]
         c["_haversine_dist"] = haversine_distance(origin_lat, origin_lng, c_loc["lat"], c_loc["lng"])
 
     candidate_list.sort(key=lambda x: x["_haversine_dist"])
-    top_candidates = candidate_list[:10]  # Take top 10 closest to compute road distance
+    pool_size = max(10, target_count * 2)
+    top_candidates = candidate_list[:pool_size]  # Take top candidates to compute road distance
 
     # 4. Compute Real Road / Walking Distance
     ranked_candidates = client.get_road_distances(origin_lat, origin_lng, top_candidates, mode=mode)
 
     # 5. Sort strictly by Road Distance (meters) Ascending
     ranked_candidates.sort(key=lambda x: x.get("road_distance_meters", 999999))
-    top_5 = ranked_candidates[:target_count]
+    top_matched = ranked_candidates[:target_count]
 
     # 6. Format Structured Records
     matched_records = []
-    for rank_idx, pharm in enumerate(top_5, 1):
+    for rank_idx, pharm in enumerate(top_matched, 1):
         pharm_name = pharm.get("name", "Unknown Pharmacy")
         pharm_address = pharm.get("vicinity") or pharm.get("formatted_address", "")
         
@@ -586,7 +591,7 @@ def find_top_pharmacies_for_doctor(
             "Doctor City": doc_city,
             "Doctor Lat": origin_lat,
             "Doctor Lng": origin_lng,
-            "Rank": rank_idx,
+            "Pharmacy Rank": rank_idx,
             "Pharmacy Name": pharm_name,
             "Pharmacy Address": pharm_address,
             "Pharmacy Pincode": p_pincode,
@@ -594,8 +599,6 @@ def find_top_pharmacies_for_doctor(
             "Pharmacy Distance (meters)": dist_meters,
             "Pharmacy Distance (km)": dist_km,
             "Travel Time": travel_time,
-            "Rating": pharm.get("rating", "N/A"),
-            "Total Ratings": pharm.get("user_ratings_total", 0),
             "Google Maps URL": gmaps_url,
             "Place ID": place_id
         }
@@ -613,12 +616,14 @@ def process_doctor_file(
     api_key: str,
     limit: Optional[int] = None,
     base_radius: int = 300,
+    max_radius: int = 10000,
+    target_count: int = 5,
     mode: str = "walking"
 ):
     logger.info(f"Starting Doctor-Pharmacy Matching Pipeline...")
     logger.info(f"Input File: {input_file}")
     logger.info(f"Output File: {output_excel}")
-    logger.info(f"Search Strategy: Smart Adaptive (Base: {base_radius}m, Mode: {mode})")
+    logger.info(f"Search Strategy: Smart Adaptive (Base: {base_radius}m -> Max: {max_radius}m, Target: {target_count}, Mode: {mode})")
 
     # Read Input
     df_doctors = pd.read_excel(input_file)
@@ -647,6 +652,8 @@ def process_doctor_file(
             doc_row=doc_row,
             client=client,
             base_radius=base_radius,
+            max_radius=max_radius,
+            target_count=target_count,
             mode=mode
         )
         
@@ -680,7 +687,7 @@ def process_doctor_file(
             "Pharmacies Found": len(doc_matches)
         }
         
-        for rank in range(1, 6):
+        for rank in range(1, target_count + 1):
             if rank <= len(doc_matches):
                 m = doc_matches[rank - 1]
                 row_dict[f"Pharmacy_{rank}_Name"] = m["Pharmacy Name"]
@@ -743,12 +750,14 @@ def process_doctor_file(
 # CLI Entry Point
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Find 5 closest pharmacies per doctor using Google Maps API")
+    parser = argparse.ArgumentParser(description="Find closest pharmacies per doctor using Google Maps API")
     parser.add_argument("--input", default="All_doctors.xlsx", help="Path to input Excel file")
     parser.add_argument("--output", default="final_doctor_nearest_5_chemists.xlsx", help="Path to output Excel file")
     parser.add_argument("--key", default="", help="Google Maps API Key (optional, defaults to .env)")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit for testing (e.g. --limit 5)")
     parser.add_argument("--radius", type=int, default=300, help="Initial search radius in meters (default: 300)")
+    parser.add_argument("--max-radius", type=int, default=10000, help="Maximum search radius in meters (default: 10000)")
+    parser.add_argument("--target-count", type=int, default=5, help="Target number of pharmacies per doctor (default: 5)")
     parser.add_argument("--mode", default="walking", choices=["walking", "driving"], help="Distance mode (default: walking)")
 
     args = parser.parse_args()
@@ -760,5 +769,7 @@ if __name__ == "__main__":
         api_key=api_key,
         limit=args.limit,
         base_radius=args.radius,
+        max_radius=args.max_radius,
+        target_count=args.target_count,
         mode=args.mode
     )

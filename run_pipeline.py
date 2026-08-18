@@ -578,6 +578,18 @@ class GoogleMapsEngine:
         return results
 
 
+def get_adaptive_radius_steps(base_radius: int = 300, max_radius: int = 10000) -> List[int]:
+    """Generates an expanding ladder of search radius thresholds up to max_radius."""
+    tiers = [300, 800, 1500, 2500, 3500, 5000, 7500, 10000]
+    steps = [base_radius]
+    for t in tiers:
+        if t > base_radius and t <= max_radius:
+            steps.append(t)
+    if max_radius not in steps and max_radius > base_radius:
+        steps.append(max_radius)
+    return sorted(list(set(steps)))
+
+
 # ---------------------------------------------------------
 # Unified Pipeline Runner
 # ---------------------------------------------------------
@@ -587,6 +599,8 @@ def run_unified_pipeline(
     summary_txt: str = "summary_report.txt",
     limit: Optional[int] = None,
     base_radius: int = 300,
+    max_radius: int = 10000,
+    target_count: int = 5,
     api_key: Optional[str] = None
 ):
     key = api_key or load_api_key()
@@ -600,7 +614,7 @@ def run_unified_pipeline(
     logger.info("STARTING UNIFIED DOCTOR-PHARMACY PIPELINE")
     logger.info(f"Input: {input_file} | Output: {output_excel}")
     logger.info(f"Summary Report: {summary_txt}")
-    logger.info(f"Walking Mode: Enabled | Initial Radius: {base_radius}m (Adaptive)")
+    logger.info(f"Walking Mode: Enabled | Adaptive Radius: {base_radius}m -> {max_radius}m (Target: {target_count})")
     logger.info("=================================================================")
 
     # 1. Read Input Dataset
@@ -664,11 +678,11 @@ def run_unified_pipeline(
             "Formatted Address": geo.get("formatted_address")
         })
 
-        # Phase 3: Smart Adaptive Search (300m -> 800m -> 1500m)
-        current_radius = base_radius
+        # Phase 3: Multi-Tier Smart Adaptive Search (expanding until target_count chemists are found)
+        radius_steps = get_adaptive_radius_steps(base_radius=base_radius, max_radius=max_radius)
         candidates = {}
 
-        while current_radius <= 1500:
+        for current_radius in radius_steps:
             raw_places = engine.search_nearby_pharmacies(origin_lat, origin_lng, radius=current_radius)
             for p in raw_places:
                 # Filter non-pharmacy entities (clinics, doctors, labs, diagnostics, surgicals, enterprises, banking, gyms, pets, ayurveda, etc.)
@@ -680,18 +694,11 @@ def run_unified_pipeline(
                 if pid and pid not in candidates:
                     candidates[pid] = p
 
-            if len(candidates) >= 5:
-                break
-            
-            if current_radius == base_radius:
-                current_radius = 800
-            elif current_radius == 800:
-                current_radius = 1500
-            else:
+            if len(candidates) >= target_count:
                 break
 
         if not candidates:
-            logger.info(f"   [-] 0 pharmacies found within 1500m for {doc_id}")
+            logger.info(f"   [-] 0 pharmacies found within {max_radius}m for {doc_id}")
             telemetry.doctors_with_zero_pharmacies += 1
             continue
 
@@ -702,22 +709,23 @@ def run_unified_pipeline(
             c["_h_dist"] = haversine_distance(origin_lat, origin_lng, c_loc["lat"], c_loc["lng"])
 
         candidate_list.sort(key=lambda x: x["_h_dist"])
-        top_candidates = candidate_list[:10]
+        pool_size = max(10, target_count * 2)
+        top_candidates = candidate_list[:pool_size]
 
         ranked = engine.compute_walking_distances(origin_lat, origin_lng, top_candidates)
         ranked.sort(key=lambda x: x.get("road_distance_meters", 999999))
-        top_5 = ranked[:5]
+        top_matched = ranked[:target_count]
 
         # Telemetry counts
-        if len(top_5) == 5:
+        if len(top_matched) == target_count:
             telemetry.doctors_with_5_pharmacies += 1
-        elif len(top_5) > 0:
+        elif len(top_matched) > 0:
             telemetry.doctors_with_fewer_pharmacies += 1
 
-        telemetry.total_pharmacies_matched += len(top_5)
+        telemetry.total_pharmacies_matched += len(top_matched)
 
         # Phase 5: Format Final Records
-        for rank_idx, pharm in enumerate(top_5, 1):
+        for rank_idx, pharm in enumerate(top_matched, 1):
             p_name = pharm.get("name", "Unknown Pharmacy")
             p_address = pharm.get("vicinity") or pharm.get("formatted_address", "")
             p_pin = extract_indian_pincode(p_address) or doc_pincode
@@ -745,7 +753,7 @@ def run_unified_pipeline(
                 "Google Maps URL": gmaps_url
             })
 
-        logger.info(f"   [✓] Matched {len(top_5)} pharmacies (Closest: {top_5[0]['name']} at {top_5[0].get('road_distance_meters')}m)")
+        logger.info(f"   [✓] Matched {len(top_matched)} pharmacies (Closest: {top_matched[0]['name']} at {top_matched[0].get('road_distance_meters')}m)")
 
         # Periodic intermediate Excel checkpoint save (every 25 doctors)
         if idx % 25 == 0 or idx == total_docs:
@@ -788,16 +796,16 @@ def run_unified_pipeline(
 ================================================================================
 Generated On:           {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 Total Execution Time:   {telemetry.elapsed_seconds} seconds
+Total Doctors in Input: {telemetry.total_doctors}
 Input File:             {os.path.abspath(input_file)}
 Final Excel Output:     {os.path.abspath(saved_excel_path)}
 Intermediate Geocodes:  {os.path.abspath(geocoded_master_path)}
 
 --------------------------------------------------------------------------------
-1. DATASET & DOCTOR MATCHING RESULTS
+1. DOCTOR MATCHING BREAKDOWN
 --------------------------------------------------------------------------------
-Total Doctors Processed:                    {telemetry.total_doctors}
-Total Doctors with Exactly 5 Pharmacies:    {telemetry.doctors_with_5_pharmacies}
-Total Doctors with 1 to 4 Pharmacies:       {telemetry.doctors_with_fewer_pharmacies}
+Total Doctors with Exactly {target_count} Pharmacies:   {telemetry.doctors_with_5_pharmacies}
+Total Doctors with 1 to {target_count-1} Pharmacies:       {telemetry.doctors_with_fewer_pharmacies}
 Total Doctors with 0 Pharmacies Found:      {telemetry.doctors_with_zero_pharmacies}
 Total Pharmacy Match Records Generated:     {telemetry.total_pharmacies_matched}
 
@@ -810,7 +818,7 @@ A. GEOCODING API:
    - Geocoding Successes:                   {telemetry.geocoding_successes}
    - Geocoding Failures:                    {telemetry.geocoding_failures}
 
-B. PLACES API (Nearby Search - 300m Adaptive):
+B. PLACES API (Nearby Search - Multi-Tier Adaptive):
    - Fresh API Calls Made:                  {telemetry.places_api_calls}
    - Cache Hits (Reused from SQLite):       {telemetry.places_cache_hits}
    - Successful Searches (Pharmacies >= 1): {telemetry.places_successes}
@@ -857,6 +865,8 @@ if __name__ == "__main__":
     parser.add_argument("--summary", default="summary_report.txt", help="Summary report TXT path")
     parser.add_argument("--limit", type=int, default=None, help="Process first N doctors (optional)")
     parser.add_argument("--radius", type=int, default=300, help="Initial search radius in meters (default: 300)")
+    parser.add_argument("--max-radius", type=int, default=10000, help="Maximum search radius in meters (default: 10000)")
+    parser.add_argument("--target-count", type=int, default=5, help="Target number of pharmacies per doctor (default: 5)")
 
     args = parser.parse_args()
 
@@ -865,5 +875,7 @@ if __name__ == "__main__":
         output_excel=args.output,
         summary_txt=args.summary,
         limit=args.limit,
-        base_radius=args.radius
+        base_radius=args.radius,
+        max_radius=args.max_radius,
+        target_count=args.target_count
     )
