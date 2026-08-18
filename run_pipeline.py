@@ -225,6 +225,19 @@ class CacheManager:
 # ---------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------
+def add_timestamp(filepath: str, timestamp_str: Optional[str] = None) -> str:
+    """
+    Appends a timestamp suffix to a file path before the extension.
+    Example: 'final_doctor_nearest_5_chemists.xlsx' -> 'final_doctor_nearest_5_chemists_20260818_150336.xlsx'
+    """
+    if not timestamp_str:
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dirname, filename = os.path.split(filepath)
+    base, ext = os.path.splitext(filename)
+    new_filename = f"{base}_{timestamp_str}{ext}"
+    return os.path.join(dirname, new_filename) if dirname else new_filename
+
+
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Computes approximate straight-line distance in meters between two coordinates."""
     R = 6371000
@@ -616,14 +629,22 @@ def run_unified_pipeline(
     base_radius: int = 300,
     max_radius: int = 10000,
     target_count: int = 5,
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None,
+    use_timestamp: bool = True
 ):
     key = api_key or load_api_key()
     telemetry = Telemetry()
     telemetry.start()
 
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if use_timestamp:
+        output_excel = add_timestamp(output_excel, run_timestamp)
+        summary_txt = add_timestamp(summary_txt, run_timestamp)
+        geocoded_master_path = add_timestamp("checkpoints/intermediate_geocoded_doctors.xlsx", run_timestamp)
+    else:
+        geocoded_master_path = "checkpoints/intermediate_geocoded_doctors.xlsx"
+
     os.makedirs("checkpoints", exist_ok=True)
-    geocoded_master_path = "checkpoints/intermediate_geocoded_doctors.xlsx"
 
     logger.info("=================================================================")
     logger.info("STARTING UNIFIED DOCTOR-PHARMACY PIPELINE")
@@ -882,6 +903,7 @@ if __name__ == "__main__":
     parser.add_argument("--radius", type=int, default=300, help="Initial search radius in meters (default: 300)")
     parser.add_argument("--max-radius", type=int, default=10000, help="Maximum search radius in meters (default: 10000)")
     parser.add_argument("--target-count", type=int, default=5, help="Target number of pharmacies per doctor (default: 5)")
+    parser.add_argument("--no-timestamp", action="store_true", help="Disable automatic timestamp suffix on output file names")
 
     args = parser.parse_args()
 
@@ -892,5 +914,6 @@ if __name__ == "__main__":
         limit=args.limit,
         base_radius=args.radius,
         max_radius=args.max_radius,
-        target_count=args.target_count
+        target_count=args.target_count,
+        use_timestamp=not args.no_timestamp
     )

@@ -13,6 +13,7 @@ import argparse
 import logging
 from typing import Dict, List, Any, Optional, Tuple
 from urllib.parse import quote_plus
+from datetime import datetime
 
 import pandas as pd
 import requests
@@ -158,6 +159,19 @@ class CacheManager:
 # ---------------------------------------------------------
 # Helper Functions (Geometry & Parsing)
 # ---------------------------------------------------------
+def add_timestamp(filepath: str, timestamp_str: Optional[str] = None) -> str:
+    """
+    Appends a timestamp suffix to a file path before the extension.
+    Example: 'final_doctor_nearest_5_chemists.xlsx' -> 'final_doctor_nearest_5_chemists_20260818_150336.xlsx'
+    """
+    if not timestamp_str:
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dirname, filename = os.path.split(filepath)
+    base, ext = os.path.splitext(filename)
+    new_filename = f"{base}_{timestamp_str}{ext}"
+    return os.path.join(dirname, new_filename) if dirname else new_filename
+
+
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Computes approximate straight-line distance in meters between two coordinates."""
     R = 6371000  # Radius of earth in meters
@@ -627,14 +641,22 @@ def find_top_pharmacies_for_doctor(
 # ---------------------------------------------------------
 def process_doctor_file(
     input_file: str,
-    output_excel: str,
-    api_key: str,
+    output_excel: str = "final_doctor_nearest_5_chemists.xlsx",
+    api_key: str = "",
     limit: Optional[int] = None,
     base_radius: int = 300,
     max_radius: int = 10000,
     target_count: int = 5,
-    mode: str = "walking"
+    mode: str = "walking",
+    use_timestamp: bool = True
 ):
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if use_timestamp:
+        output_excel = add_timestamp(output_excel, run_timestamp)
+        checkpoint_file = add_timestamp("checkpoints/checkpoint_data.json", run_timestamp)
+    else:
+        checkpoint_file = "checkpoints/checkpoint_data.json"
+
     logger.info(f"Starting Doctor-Pharmacy Matching Pipeline...")
     logger.info(f"Input File: {input_file}")
     logger.info(f"Output File: {output_excel}")
@@ -652,7 +674,6 @@ def process_doctor_file(
     client = GoogleMapsClient(api_key=api_key, cache=cache)
 
     all_matched_records = []
-    checkpoint_file = "checkpoints/checkpoint_data.json"
     os.makedirs("checkpoints", exist_ok=True)
 
     start_time = time.time()
@@ -774,6 +795,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-radius", type=int, default=10000, help="Maximum search radius in meters (default: 10000)")
     parser.add_argument("--target-count", type=int, default=5, help="Target number of pharmacies per doctor (default: 5)")
     parser.add_argument("--mode", default="walking", choices=["walking", "driving"], help="Distance mode (default: walking)")
+    parser.add_argument("--no-timestamp", action="store_true", help="Disable automatic timestamp suffix on output file names")
 
     args = parser.parse_args()
 
@@ -786,5 +808,6 @@ if __name__ == "__main__":
         base_radius=args.radius,
         max_radius=args.max_radius,
         target_count=args.target_count,
-        mode=args.mode
+        mode=args.mode,
+        use_timestamp=not args.no_timestamp
     )
