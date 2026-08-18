@@ -279,10 +279,10 @@ def is_unwanted_pharmacy_entity(place_or_name) -> Tuple[bool, str]:
     name = anyascii(name).strip()
     name_lower = name.lower()
 
-    # 0. Reject Empty / Punctuation-only / Garbage / Dummy Placeholders (minimum 4 valid characters required)
+    # 0. Reject Empty / Punctuation-only / Garbage / Dummy Placeholders (minimum 5 valid characters required)
     alpha_letters = re.findall(r'[a-zA-Z0-9]', name)
-    if len(alpha_letters) < 4:
-        return True, f"Garbage: Too short (< 4 chars: '{name}')"
+    if len(alpha_letters) < 5:
+        return True, f"Garbage: Too short (< 5 chars: '{name}')"
 
     if re.match(r'^(test|testing|dummy|unknown|null|none|n/a|na|nil|temp|sample|untitled|fake|invalid)$', name_lower):
         return True, "Garbage: Placeholder/Dummy"
