@@ -21,7 +21,7 @@ API_KEY = load_api_key()
 def test_geocoding():
     print("Testing Geocoding API...")
     url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {"address": "Bhiwandi, Mumbai, 421301", "key": API_KEY}
+    params = {"address": "Bhiwandi, Mumbai, 421301", "language": "en", "key": API_KEY}
     res = requests.get(url, params=params).json()
     status = res.get("status")
     print(f"Geocoding Status: {status}")
@@ -42,6 +42,7 @@ def test_places(loc):
         "location": f"{loc['lat']},{loc['lng']}",
         "radius": 300,
         "type": "pharmacy",
+        "language": "en",
         "key": API_KEY
     }
     res = requests.get(url, params=params).json()
@@ -67,6 +68,7 @@ def test_distance_matrix(origin, destinations):
         "origins": f"{origin['lat']},{origin['lng']}",
         "destinations": dest_str,
         "mode": "walking",
+        "language": "en",
         "key": API_KEY
     }
     res = requests.get(url, params=params).json()

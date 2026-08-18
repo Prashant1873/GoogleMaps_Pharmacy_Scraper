@@ -20,6 +20,7 @@ from datetime import datetime
 
 import pandas as pd
 import requests
+from anyascii import anyascii
 
 # ---------------------------------------------------------
 # Environment & Configuration
@@ -275,6 +276,7 @@ def is_unwanted_pharmacy_entity(place_or_name) -> Tuple[bool, str]:
         name = str(place_or_name).strip()
         types = set()
 
+    name = anyascii(name)
     name_lower = name.lower()
 
     # 1. Place Types Filter (pure non-pharmacies)
@@ -395,7 +397,7 @@ class GoogleMapsEngine:
             self.telemetry.geocoding_api_calls += 1
             url = "https://maps.googleapis.com/maps/api/geocode/json"
             try:
-                res = self.session.get(url, params={"address": query, "key": self.api_key}, timeout=15).json()
+                res = self.session.get(url, params={"address": query, "language": "en", "key": self.api_key}, timeout=15).json()
                 status = res.get("status")
                 if status == "OK" and res.get("results"):
                     result = res["results"][0]
@@ -454,6 +456,7 @@ class GoogleMapsEngine:
             "location": f"{lat},{lng}",
             "radius": radius,
             "type": "pharmacy",
+            "language": "en",
             "key": self.api_key
         }
 
@@ -521,6 +524,7 @@ class GoogleMapsEngine:
                     "origins": f"{origin_lat},{origin_lng}",
                     "destinations": "|".join(b_coords),
                     "mode": "walking",
+                    "language": "en",
                     "key": self.api_key
                 }
 
@@ -726,8 +730,8 @@ def run_unified_pipeline(
 
         # Phase 5: Format Final Records
         for rank_idx, pharm in enumerate(top_matched, 1):
-            p_name = pharm.get("name", "Unknown Pharmacy")
-            p_address = pharm.get("vicinity") or pharm.get("formatted_address", "")
+            p_name = anyascii(pharm.get("name", "Unknown Pharmacy"))
+            p_address = anyascii(pharm.get("vicinity") or pharm.get("formatted_address", ""))
             p_pin = extract_indian_pincode(p_address) or doc_pincode
             p_city = extract_city(p_address, fallback_city=doc_city)
             dist_m = pharm.get("road_distance_meters", 0)

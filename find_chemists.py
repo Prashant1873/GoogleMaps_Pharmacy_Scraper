@@ -16,6 +16,7 @@ from urllib.parse import quote_plus
 
 import pandas as pd
 import requests
+from anyascii import anyascii
 
 # ---------------------------------------------------------
 # Configuration & Constants
@@ -209,6 +210,7 @@ def is_unwanted_pharmacy_entity(place_or_name) -> Tuple[bool, str]:
         name = str(place_or_name).strip()
         types = set()
 
+    name = anyascii(name)
     name_lower = name.lower()
 
     # 1. Place Types Filter (pure non-pharmacies)
@@ -316,7 +318,7 @@ class GoogleMapsClient:
 
             url = "https://maps.googleapis.com/maps/api/geocode/json"
             try:
-                res = self.session.get(url, params={"address": query, "key": self.api_key}, timeout=15).json()
+                res = self.session.get(url, params={"address": query, "language": "en", "key": self.api_key}, timeout=15).json()
                 status = res.get("status")
                 if status == "OK" and res.get("results"):
                     result = res["results"][0]
@@ -371,6 +373,7 @@ class GoogleMapsClient:
             "location": f"{lat},{lng}",
             "radius": radius,
             "type": "pharmacy",
+            "language": "en",
             "key": self.api_key
         }
 
@@ -432,6 +435,7 @@ class GoogleMapsClient:
                     "origins": f"{origin_lat},{origin_lng}",
                     "destinations": "|".join(b_coords),
                     "mode": mode,
+                    "language": "en",
                     "key": self.api_key
                 }
 
@@ -570,8 +574,8 @@ def find_top_pharmacies_for_doctor(
     # 6. Format Structured Records
     matched_records = []
     for rank_idx, pharm in enumerate(top_matched, 1):
-        pharm_name = pharm.get("name", "Unknown Pharmacy")
-        pharm_address = pharm.get("vicinity") or pharm.get("formatted_address", "")
+        pharm_name = anyascii(pharm.get("name", "Unknown Pharmacy"))
+        pharm_address = anyascii(pharm.get("vicinity") or pharm.get("formatted_address", ""))
         
         # Pincode extraction
         p_pincode = extract_indian_pincode(pharm_address) or doc_pincode
