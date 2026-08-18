@@ -50,8 +50,8 @@ Built with persistent caching, adaptive radius expansion, walking route calculat
 Clone this repository and install required packages:
 
 ```bash
-git clone <REPOSITORY_URL>
-cd <REPOSITORY_FOLDER>
+git clone https://github.com/Prashant1873/GoogleMaps_Pharmacy_Scraper.git
+cd GoogleMaps_Pharmacy_Scraper
 
 # (Optional) Create and activate a virtual environment
 python -m venv venv
