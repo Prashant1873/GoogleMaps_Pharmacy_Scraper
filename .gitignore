@@ -30,5 +30,5 @@ final_doctor_nearest_*.xlsx
 final_doctor_nearest_*.csv
 *_matches.csv
 *_cleaned.xlsx
-summary_report.txt
+summary_report*.txt
 

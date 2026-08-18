@@ -14,6 +14,7 @@ import time
 import sqlite3
 import argparse
 import logging
+import glob
 from typing import Dict, List, Any, Optional, Tuple
 from urllib.parse import quote_plus
 from datetime import datetime
@@ -255,17 +256,54 @@ def extract_indian_pincode(text: str) -> Optional[str]:
     matches = re.findall(r'\b[1-9][0-9]{5}\b', str(text))
     return matches[-1] if matches else None
 
+def cleanup_old_results(base_dir: str = ".") -> List[str]:
+    """
+    Deletes all previous run result files and checkpoints before starting a new run.
+    Cleans:
+    - final_doctor_nearest_*.xlsx / final_doctor_nearest_*.csv
+    - summary_report*.txt
+    - checkpoints/*.xlsx / checkpoints/*.json
+    """
+    patterns = [
+        os.path.join(base_dir, "final_doctor_nearest_*.xlsx"),
+        os.path.join(base_dir, "final_doctor_nearest_*.csv"),
+        os.path.join(base_dir, "summary_report*.txt"),
+        os.path.join(base_dir, "checkpoints", "*.xlsx"),
+        os.path.join(base_dir, "checkpoints", "*.json"),
+    ]
+    deleted_files = []
+    for pattern in patterns:
+        for filepath in glob.glob(pattern):
+            try:
+                if os.path.isfile(filepath):
+                    os.remove(filepath)
+                    deleted_files.append(filepath)
+            except Exception as e:
+                logger.warning(f"Could not delete old file {filepath}: {e}")
+    
+    if deleted_files:
+        logger.info(f"Cleaned up {len(deleted_files)} old result/checkpoint file(s): {[os.path.basename(f) for f in deleted_files]}")
+    else:
+        logger.info("No old result files found to clean.")
+    return deleted_files
+
+
 def extract_city(address: str, fallback_city: str = "") -> str:
-    """Extracts locality or city from address string."""
+    """
+    Returns the exact city where the associated doctor is located.
+    Falls back to cleaned doctor city or address parsing if doctor city is missing.
+    """
+    if fallback_city and str(fallback_city).strip() and str(fallback_city).strip().lower() not in ["nan", "none", ""]:
+        return str(fallback_city).strip()
     if not address:
-        return fallback_city
-    parts = [p.strip() for p in address.split(",") if p.strip()]
+        return ""
+    parts = [p.strip() for p in str(address).split(",") if p.strip()]
     if len(parts) >= 2:
         for part in reversed(parts):
             cleaned = re.sub(r'\b[1-9][0-9]{5}\b', '', part).strip()
             if cleaned and cleaned.lower() not in ["india", "maharashtra", "delhi", "karnataka", "tamil nadu", "west bengal", "uttar pradesh", "gujarat"]:
                 return cleaned
-    return fallback_city
+    return ""
 
 
 def is_unwanted_pharmacy_entity(place_or_name) -> Tuple[bool, str]:
@@ -640,11 +678,14 @@ def run_unified_pipeline(
     if use_timestamp:
         output_excel = add_timestamp(output_excel, run_timestamp)
         summary_txt = add_timestamp(summary_txt, run_timestamp)
-        geocoded_master_path = add_timestamp("checkpoints/intermediate_geocoded_doctors.xlsx", run_timestamp)
+        geocoded_master_path = add_timestamp(os.path.join("checkpoints", "intermediate_geocoded_doctors.xlsx"), run_timestamp)
     else:
-        geocoded_master_path = "checkpoints/intermediate_geocoded_doctors.xlsx"
+        geocoded_master_path = os.path.join("checkpoints", "intermediate_geocoded_doctors.xlsx")
 
     os.makedirs("checkpoints", exist_ok=True)
+
+    # Clean up previous run result files and checkpoints before starting a new run
+    cleanup_old_results(base_dir=os.path.dirname(os.path.abspath(output_excel)) or ".")
 
     logger.info("=================================================================")
     logger.info("STARTING UNIFIED DOCTOR-PHARMACY PIPELINE")
@@ -673,7 +714,9 @@ def run_unified_pipeline(
         doc_name = str(doc_row.get("DOCTOR NAME", "Unknown"))
         doc_address = str(doc_row.get("Address", ""))
         doc_pincode = str(doc_row.get("Pincode", "")).replace(".0", "")
-        doc_city = str(doc_row.get("Doctor City", ""))
+        doc_city = str(doc_row.get("Doctor City", "") or doc_row.get("City", "") or doc_row.get("CITY", "") or "").strip()
+        if doc_city.lower() in ["nan", "none"]:
+            doc_city = ""
 
         logger.info(f"[{idx}/{total_docs}] Doctor {doc_id}: {doc_name} ({doc_city})...")
 
@@ -791,10 +834,18 @@ def run_unified_pipeline(
 
         logger.info(f"   [✓] Matched {len(top_matched)} pharmacies (Closest: {top_matched[0]['name']} at {top_matched[0].get('road_distance_meters')}m)")
 
-        # Periodic intermediate Excel checkpoint save (every 25 doctors)
-        if idx % 25 == 0 or idx == total_docs:
-            pd.DataFrame(geocoded_records).to_excel(geocoded_master_path, index=False)
-            logger.info(f"   --> Saved intermediate geocode checkpoint ({len(geocoded_records)} doctors) to {geocoded_master_path}")
+        # Periodic intermediate Excel checkpoint save (every 100 doctors or at completion)
+        if idx % 100 == 0 or idx == total_docs:
+            try:
+                pd.DataFrame(geocoded_records).to_excel(geocoded_master_path, index=False)
+                logger.info(f"   --> Saved intermediate geocode checkpoint ({len(geocoded_records)} doctors) to {geocoded_master_path}")
+            except Exception as e:
+                try:
+                    csv_checkpoint = geocoded_master_path.rsplit(".", 1)[0] + ".csv"
+                    pd.DataFrame(geocoded_records).to_csv(csv_checkpoint, index=False)
+                except Exception:
+                    pass
+                logger.warning(f"   [!] Note: Intermediate checkpoint Excel locked by system ({e}). Continued execution safely.")
 
     telemetry.stop()
 

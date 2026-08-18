@@ -11,6 +11,7 @@ import time
 import sqlite3
 import argparse
 import logging
+import glob
 from typing import Dict, List, Any, Optional, Tuple
 from urllib.parse import quote_plus
 from datetime import datetime
@@ -189,18 +190,54 @@ def extract_indian_pincode(text: str) -> Optional[str]:
     matches = re.findall(r'\b[1-9][0-9]{5}\b', str(text))
     return matches[-1] if matches else None
 
+def cleanup_old_results(base_dir: str = ".") -> List[str]:
+    """
+    Deletes all previous run result files and checkpoints before starting a new run.
+    Cleans:
+    - final_doctor_nearest_*.xlsx / final_doctor_nearest_*.csv
+    - summary_report*.txt
+    - checkpoints/*.xlsx / checkpoints/*.json
+    """
+    patterns = [
+        os.path.join(base_dir, "final_doctor_nearest_*.xlsx"),
+        os.path.join(base_dir, "final_doctor_nearest_*.csv"),
+        os.path.join(base_dir, "summary_report*.txt"),
+        os.path.join(base_dir, "checkpoints", "*.xlsx"),
+        os.path.join(base_dir, "checkpoints", "*.json"),
+    ]
+    deleted_files = []
+    for pattern in patterns:
+        for filepath in glob.glob(pattern):
+            try:
+                if os.path.isfile(filepath):
+                    os.remove(filepath)
+                    deleted_files.append(filepath)
+            except Exception as e:
+                logger.warning(f"Could not delete old file {filepath}: {e}")
+    
+    if deleted_files:
+        logger.info(f"Cleaned up {len(deleted_files)} old result/checkpoint file(s): {[os.path.basename(f) for f in deleted_files]}")
+    else:
+        logger.info("No old result files found to clean.")
+    return deleted_files
+
+
 def extract_city(address: str, fallback_city: str = "") -> str:
-    """Extracts probable city/area from address string or falls back to provided city."""
+    """
+    Returns the exact city where the associated doctor is located.
+    Falls back to cleaned doctor city or address parsing if doctor city is missing.
+    """
+    if fallback_city and str(fallback_city).strip() and str(fallback_city).strip().lower() not in ["nan", "none", ""]:
+        return str(fallback_city).strip()
     if not address:
-        return fallback_city
-    parts = [p.strip() for p in address.split(",") if p.strip()]
+        return ""
+    parts = [p.strip() for p in str(address).split(",") if p.strip()]
     if len(parts) >= 2:
-        # Avoid pincode-only parts
         for part in reversed(parts):
             cleaned = re.sub(r'\b[1-9][0-9]{5}\b', '', part).strip()
             if cleaned and cleaned.lower() not in ["india", "maharashtra", "delhi", "karnataka", "tamil nadu", "west bengal", "uttar pradesh", "gujarat"]:
                 return cleaned
-    return fallback_city
+    return ""
 
 
 def is_unwanted_pharmacy_entity(place_or_name) -> Tuple[bool, str]:
@@ -542,11 +579,13 @@ def find_top_pharmacies_for_doctor(
     mode: str = "walking"
 ) -> List[Dict[str, Any]]:
     """Finds and ranks top pharmacies for a single doctor using multi-tier smart adaptive radius."""
-    doc_id = doc_row.get("Doc ID", "")
-    doc_name = doc_row.get("DOCTOR NAME", "")
-    doc_address = doc_row.get("Address", "")
-    doc_pincode = str(doc_row.get("Pincode", ""))
-    doc_city = str(doc_row.get("Doctor City", ""))
+    doc_id = str(doc_row.get("Doc ID", ""))
+    doc_name = str(doc_row.get("DOCTOR NAME", ""))
+    doc_address = str(doc_row.get("Address", ""))
+    doc_pincode = str(doc_row.get("Pincode", "")).replace(".0", "")
+    doc_city = str(doc_row.get("Doctor City", "") or doc_row.get("City", "") or doc_row.get("CITY", "") or "").strip()
+    if doc_city.lower() in ["nan", "none"]:
+        doc_city = ""
 
     # 1. Geocode Doctor
     geo = client.geocode_address(doc_address, doc_city, doc_pincode)
@@ -657,6 +696,9 @@ def process_doctor_file(
     else:
         checkpoint_file = "checkpoints/checkpoint_data.json"
 
+    # Clean up previous run result files and checkpoints before starting a new run
+    cleanup_old_results(base_dir=os.path.dirname(os.path.abspath(output_excel)) or ".")
+
     logger.info(f"Starting Doctor-Pharmacy Matching Pipeline...")
     logger.info(f"Input File: {input_file}")
     logger.info(f"Output File: {output_excel}")
@@ -713,13 +755,16 @@ def process_doctor_file(
     for _, doc_row in df_doctors.iterrows():
         doc_id = doc_row.get("Doc ID")
         doc_matches = [m for m in all_matched_records if m["Doc ID"] == doc_id]
+        doc_city = str(doc_row.get("Doctor City", "") or doc_row.get("City", "") or doc_row.get("CITY", "") or "").strip()
+        if doc_city.lower() in ["nan", "none"]:
+            doc_city = ""
         
         row_dict = {
             "Doc ID": doc_id,
             "Doctor Name": doc_row.get("DOCTOR NAME"),
             "Doctor Address": doc_row.get("Address"),
             "Doctor Pincode": doc_row.get("Pincode"),
-            "Doctor City": doc_row.get("Doctor City"),
+            "Doctor City": doc_city,
             "Pharmacies Found": len(doc_matches)
         }
         
