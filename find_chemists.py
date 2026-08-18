@@ -210,8 +210,19 @@ def is_unwanted_pharmacy_entity(place_or_name) -> Tuple[bool, str]:
         name = str(place_or_name).strip()
         types = set()
 
-    name = anyascii(name)
+    name = anyascii(name).strip()
     name_lower = name.lower()
+
+    # 0. Reject Empty / Punctuation-only / Garbage / Dummy Placeholders (minimum 4 valid characters required)
+    alpha_letters = re.findall(r'[a-zA-Z0-9]', name)
+    if len(alpha_letters) < 4:
+        return True, f"Garbage: Too short (< 4 chars: '{name}')"
+
+    if re.match(r'^(test|testing|dummy|unknown|null|none|n/a|na|nil|temp|sample|untitled|fake|invalid)$', name_lower):
+        return True, "Garbage: Placeholder/Dummy"
+
+    if re.match(r'^(test|dummy|fake|sample)\s+(pharmacy|medical|chemist|store|shop)$', name_lower):
+        return True, "Garbage: Test/Fake Pharmacy"
 
     # 1. Place Types Filter (pure non-pharmacies)
     if types.intersection({"veterinary_care", "pet_store"}):
