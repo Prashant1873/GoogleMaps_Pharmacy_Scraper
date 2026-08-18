@@ -1,0 +1,26 @@
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Databases & Cache
+cache.db
+*.sqlite
+*.sqlite3
+*.db
+
+# Intermediate Checkpoints & Output Logs
+checkpoints/
+output/
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
