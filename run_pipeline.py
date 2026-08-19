@@ -11,6 +11,7 @@ import os
 import re
 import math
 import time
+import json
 import sqlite3
 import argparse
 import logging
@@ -71,6 +72,10 @@ class Telemetry:
         self.places_successes = 0
         self.places_empty = 0
 
+        self.place_details_api_calls = 0
+        self.place_details_cache_hits = 0
+        self.place_details_successes = 0
+
         self.distance_api_elements = 0
         self.distance_cache_hits = 0
         self.distance_successes = 0
@@ -100,18 +105,21 @@ class Telemetry:
     def calculate_costs_inr(self) -> Dict[str, float]:
         """Calculates estimated Google Maps Platform India INR costs."""
         # India rates per 1,000 requests
-        rate_geocoding = 130.0 / 1000.0   # ~₹0.13 per call
-        rate_places = 850.0 / 1000.0      # ~₹0.85 per call
-        rate_distance = 130.0 / 1000.0    # ~₹0.13 per element
+        rate_geocoding = 130.0 / 1000.0       # ~₹0.13 per call
+        rate_places = 850.0 / 1000.0          # ~₹0.85 per call
+        rate_place_details = 850.0 / 1000.0   # ~₹0.85 per call
+        rate_distance = 130.0 / 1000.0        # ~₹0.13 per element
 
         cost_geocoding = self.geocoding_api_calls * rate_geocoding
         cost_places = self.places_api_calls * rate_places
+        cost_place_details = self.place_details_api_calls * rate_place_details
         cost_distance = self.distance_api_elements * rate_distance
-        total_gross = cost_geocoding + cost_places + cost_distance
+        total_gross = cost_geocoding + cost_places + cost_place_details + cost_distance
 
         return {
             "geocoding_inr": round(cost_geocoding, 2),
             "places_inr": round(cost_places, 2),
+            "place_details_inr": round(cost_place_details, 2),
             "distance_inr": round(cost_distance, 2),
             "total_gross_inr": round(total_gross, 2),
             "net_out_of_pocket_inr": 0.00  # Covered under free tier monthly allowance
@@ -145,6 +153,17 @@ class CacheManager:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS places_cache (
                     cache_key TEXT PRIMARY KEY,
+                    raw_json TEXT,
+                    status TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS place_details_cache (
+                    place_id TEXT PRIMARY KEY,
+                    formatted_address TEXT,
+                    vicinity TEXT,
+                    postal_code TEXT,
+                    city TEXT,
                     raw_json TEXT,
                     status TEXT
                 )
@@ -198,6 +217,30 @@ class CacheManager:
                 INSERT OR REPLACE INTO places_cache (cache_key, raw_json, status)
                 VALUES (?, ?, ?)
             """, (cache_key, raw_json, status))
+            conn.commit()
+
+    def get_place_details(self, place_id: str) -> Optional[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT formatted_address, vicinity, postal_code, city, raw_json, status FROM place_details_cache WHERE place_id = ?", (place_id.strip(),))
+            row = cur.fetchone()
+            if row:
+                return {
+                    "formatted_address": row[0],
+                    "vicinity": row[1],
+                    "postal_code": row[2],
+                    "city": row[3],
+                    "raw_json": row[4],
+                    "status": row[5]
+                }
+        return None
+
+    def save_place_details(self, place_id: str, data: Dict[str, Any]):
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO place_details_cache (place_id, formatted_address, vicinity, postal_code, city, raw_json, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (place_id.strip(), data.get("formatted_address"), data.get("vicinity"), data.get("postal_code"), data.get("city"), data.get("raw_json"), data.get("status")))
             conn.commit()
 
     def get_distance(self, cache_key: str) -> Optional[Dict[str, Any]]:
@@ -384,6 +427,96 @@ def remove_plus_codes(address: str) -> str:
     text = re.sub(r'\s+', ' ', text).strip()
     
     return text
+
+
+def is_generic_or_insufficient_address(addr: str) -> bool:
+    """
+    Checks if an address string is generic (e.g. 'India', state name only, empty, or too vague).
+    """
+    if not addr or pd.isna(addr):
+        return True
+    cleaned = str(addr).strip().lower()
+    if cleaned in ["", "india", "bharat", "none", "nan", "null", "undefined"]:
+        return True
+    
+    # Generic state names alone
+    indian_states = {
+        "andhra pradesh", "arunachal pradesh", "assam", "bihar", "chhattisgarh", "goa", "gujarat",
+        "haryana", "himachal pradesh", "jharkhand", "karnataka", "kerala", "madhya pradesh",
+        "maharashtra", "manipur", "meghalaya", "mizoram", "nagaland", "odisha", "punjab",
+        "rajasthan", "sikkim", "tamil nadu", "telangana", "tripura", "uttar pradesh", "uttarakhand",
+        "west bengal", "delhi", "chandigarh", "puducherry", "jammu and kashmir", "ladakh"
+    }
+    if cleaned in indian_states:
+        return True
+        
+    # Extremely short string without any comma, digit, or street keywords
+    if len(cleaned) <= 12 and not any(ch.isdigit() for ch in cleaned) and "," not in cleaned:
+        return True
+        
+    return False
+
+
+def resolve_pharmacy_address(
+    pharm: Dict[str, Any],
+    client_or_engine: Any,
+    doc_city: str = "",
+    doc_pincode: str = ""
+) -> Tuple[str, str, str, str]:
+    """
+    Resolves the most complete physical address, address without plus code, pincode, and city.
+    
+    Order of preference:
+    1. Place Details API formatted_address (if vicinity is generic like 'India' or missing)
+    2. Nearby search vicinity (if descriptive)
+    3. Plus code compound_code
+    4. Fallback with doctor city/pincode
+    
+    Returns: (clean_address, clean_address_no_plus, pincode, city)
+    """
+    raw_vicinity = (pharm.get("vicinity") or pharm.get("formatted_address") or "").strip()
+    place_id = pharm.get("place_id", "").strip()
+    plus_code_obj = pharm.get("plus_code", {}) or {}
+    compound_code = plus_code_obj.get("compound_code", "").strip()
+    
+    best_address = raw_vicinity
+    extracted_pin = ""
+    extracted_city = ""
+    
+    # If vicinity is generic / insufficient (like "India" or empty), resolve via Place Details API
+    if is_generic_or_insufficient_address(raw_vicinity) and place_id and hasattr(client_or_engine, "get_place_details"):
+        details = client_or_engine.get_place_details(place_id)
+        if details:
+            fmt = (details.get("formatted_address") or "").strip()
+            vic = (details.get("vicinity") or "").strip()
+            if fmt and not is_generic_or_insufficient_address(fmt):
+                best_address = fmt
+            elif vic and not is_generic_or_insufficient_address(vic):
+                best_address = vic
+            
+            extracted_pin = (details.get("postal_code") or "").strip()
+            extracted_city = (details.get("city") or "").strip()
+            
+    # Fallback to compound code if best_address is still generic
+    if is_generic_or_insufficient_address(best_address) and compound_code:
+        best_address = compound_code
+        
+    # If still generic, combine with doctor city
+    if is_generic_or_insufficient_address(best_address):
+        if doc_city:
+            best_address = f"{pharm.get('name', 'Pharmacy')}, {doc_city}"
+        else:
+            best_address = pharm.get('name', 'Pharmacy')
+            
+    clean_addr = clean_extracted_name(best_address)
+    clean_no_plus = remove_plus_codes(clean_addr)
+    if not clean_no_plus:
+        clean_no_plus = clean_addr
+        
+    final_pin = extracted_pin or extract_indian_pincode(clean_addr) or extract_indian_pincode(raw_vicinity) or doc_pincode
+    final_city = extracted_city or extract_city(clean_addr, fallback_city=doc_city)
+    
+    return clean_addr, clean_no_plus, str(final_pin).strip(), str(final_city).strip()
 
 
 def extract_establishment_name(address: str) -> Optional[str]:
@@ -796,6 +929,66 @@ class GoogleMapsEngine:
             logger.error(f"Places API error: {e}")
             return []
 
+    def get_place_details(self, place_id: str) -> Optional[Dict[str, Any]]:
+        """Queries SQLite cache or Google Place Details API for complete physical address components."""
+        place_id = str(place_id).strip()
+        if not place_id:
+            return None
+
+        # Check SQLite Cache
+        cached = self.cache.get_place_details(place_id)
+        if cached:
+            self.telemetry.place_details_cache_hits += 1
+            return cached
+
+        # Live Place Details API Call
+        self.telemetry.place_details_api_calls += 1
+        url = "https://maps.googleapis.com/maps/api/place/details/json"
+        params = {
+            "place_id": place_id,
+            "fields": "name,formatted_address,vicinity,address_components,plus_code",
+            "language": "en",
+            "key": self.api_key
+        }
+
+        try:
+            res = self.session.get(url, params=params, timeout=15).json()
+            status = res.get("status")
+            if status == "OK" and res.get("result"):
+                self.telemetry.place_details_successes += 1
+                result = res["result"]
+                formatted_address = result.get("formatted_address") or ""
+                vicinity = result.get("vicinity") or ""
+                
+                postal_code = ""
+                city = ""
+                for comp in result.get("address_components", []):
+                    types = comp.get("types", [])
+                    if "postal_code" in types and not postal_code:
+                        postal_code = comp.get("long_name", "").strip()
+                    if ("locality" in types or "administrative_area_level_2" in types) and not city:
+                        city = comp.get("long_name", "").strip()
+
+                if not postal_code:
+                    postal_code = extract_indian_pincode(formatted_address)
+
+                details_data = {
+                    "formatted_address": formatted_address,
+                    "vicinity": vicinity,
+                    "postal_code": postal_code,
+                    "city": city,
+                    "raw_json": json.dumps(result),
+                    "status": status
+                }
+                self.cache.save_place_details(place_id, details_data)
+                return details_data
+            else:
+                logger.warning(f"Place Details API status '{status}' for place_id={place_id}")
+                return None
+        except Exception as e:
+            logger.error(f"Place Details API error for place_id={place_id}: {e}")
+            return None
+
     def compute_walking_distances(
         self, origin_lat: float, origin_lng: float, destinations: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
@@ -1061,10 +1254,9 @@ def run_unified_pipeline(
         # Phase 5: Format Final Records
         for rank_idx, pharm in enumerate(top_matched, 1):
             p_name = clean_extracted_name(pharm.get("name", "Unknown Pharmacy"))
-            p_address = clean_extracted_name(pharm.get("vicinity") or pharm.get("formatted_address", ""))
-            p_address_no_plus = remove_plus_codes(p_address)
-            p_pin = extract_indian_pincode(p_address) or doc_pincode
-            p_city = extract_city(p_address, fallback_city=doc_city)
+            p_address, p_address_no_plus, p_pin, p_city = resolve_pharmacy_address(
+                pharm, engine, doc_city=doc_city, doc_pincode=doc_pincode
+            )
             dist_m = pharm.get("road_distance_meters", 0)
             dist_km = round(dist_m / 1000.0, 3)
             travel_time = pharm.get("duration_text", "")
@@ -1169,7 +1361,12 @@ B. PLACES API (Nearby Search - Multi-Tier Adaptive):
    - Successful Searches (Pharmacies >= 1): {telemetry.places_successes}
    - Empty Searches (0 Pharmacies in area): {telemetry.places_empty}
 
-C. DISTANCE MATRIX API (Walking Mode):
+C. PLACE DETAILS API (Rich Address Resolution):
+   - Fresh API Calls Made:                  {telemetry.place_details_api_calls}
+   - Cache Hits (Reused from SQLite):       {telemetry.place_details_cache_hits}
+   - Successful Address Resolutions:        {telemetry.place_details_successes}
+
+D. DISTANCE MATRIX API (Walking Mode):
    - Fresh Distance Elements Calculated:    {telemetry.distance_api_elements}
    - Cache Hits (Reused from SQLite):       {telemetry.distance_cache_hits}
    - Distance Elements Succeeded:           {telemetry.distance_successes}
@@ -1179,6 +1376,7 @@ C. DISTANCE MATRIX API (Walking Mode):
 --------------------------------------------------------------------------------
 Geocoding API Estimated Cost:               ₹{costs['geocoding_inr']}
 Places Nearby Search Estimated Cost:        ₹{costs['places_inr']}
+Place Details API Estimated Cost:           ₹{costs['place_details_inr']}
 Distance Matrix API Estimated Cost:         ₹{costs['distance_inr']}
 --------------------------------------------------------------------------------
 TOTAL ESTIMATED GROSS BILLABLE AMOUNT:      ₹{costs['total_gross_inr']}
