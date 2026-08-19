@@ -64,6 +64,7 @@ class Telemetry:
         self.geocoding_cache_hits = 0
         self.geocoding_successes = 0
         self.geocoding_failures = 0
+        self.drift_detected_and_corrected = 0
 
         self.places_api_calls = 0
         self.places_cache_hits = 0
@@ -306,6 +307,136 @@ def extract_city(address: str, fallback_city: str = "") -> str:
     return ""
 
 
+def clean_extracted_name(raw_name: str) -> str:
+    """
+    Cleans and standardizes extracted names:
+    - Transliterates non-ASCII characters to standard English Latin text
+    - Replaces pipe characters ('|', '||', '¦', '‖', etc.) with standard clean separators (' - ')
+    - Removes unnecessary decorative/special symbols (like '•', '★', '®', '™', '~', '^', '_', '`', '#', etc.)
+    - Preserves legitimate apostrophes (e.g., Mohan's, Dey's), asterisks ('*'), and alphanumeric text
+    - Strips leading/trailing punctuation and redundant whitespace
+    """
+    if not raw_name:
+        return ""
+    
+    # 1. Transliterate unicode to ASCII (handles Hindi, regional scripts, accented letters)
+    text = anyascii(str(raw_name))
+    
+    # 2. Normalize whitespace, newlines, tabs, and common HTML entities
+    text = re.sub(r'[\t\r\n\v\f]+', ' ', text)
+    text = re.sub(r'&nbsp;|&quot;|&lt;|&gt;', ' ', text)
+    text = re.sub(r'&amp;', '&', text)
+    
+    # 3. Normalize quotes and apostrophes (convert backtick, smart quotes to standard apostrophe)
+    text = text.replace('`', "'").replace('’', "'").replace('‘', "'").replace('“', '"').replace('”', '"')
+    
+    # 4. Replace pipe / vertical bar variants with ' - '
+    # Handles '|', '||', ' | ', '| - |', '¦', '‖', '∣', '│', '｜', etc.
+    text = re.sub(r'\s*[|¦‖∣│｜]+\s*', ' - ', text)
+    
+    # 5. Remove unnecessary decorative/special symbols (preserving asterisk '*')
+    # Bullets, stars, trademark, copyright, tildes, underscores, carets, section/degree symbols, hash
+    text = re.sub(r'[•·●▪◆★☆✪~^_®™©°±§#]+', ' ', text)
+    
+    # 6. Remove quotes & backslashes, but preserve in-word apostrophes like Mohan's
+    text = re.sub(r'["\\]', ' ', text)
+    text = re.sub(r"(?<![a-zA-Z0-9])'|'(?![a-zA-Z0-9])", " ", text)
+    
+    # 7. Clean up duplicate or mismatched punctuation sequences
+    text = re.sub(r'(\s*-\s*)+', ' - ', text)
+    text = re.sub(r'(\s*,\s*)+', ', ', text)
+    text = re.sub(r'\s*,\s*-\s*', ' - ', text)
+    text = re.sub(r'\s*-\s*,\s*', ' - ', text)
+    
+    # 8. Normalize spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # 9. Strip leading / trailing punctuation (hyphens, commas, colons, semicolons, slashes, pipes, dots)
+    text = re.sub(r'^[\s\-:,;./|~]+', '', text)
+    text = re.sub(r'[\s\-:,;./|~]+$', '', text)
+    
+    return text.strip()
+
+
+def remove_plus_codes(address: str) -> str:
+    """
+    Removes Google Plus Codes (Open Location Codes, e.g. 'H9P7+WGM', 'VW86+P6P', '7XXR+5RM')
+    from address strings while preserving clean street, landmark, area, city, and state information.
+    """
+    if not address or pd.isna(address):
+        return ""
+    text = str(address).strip()
+    if text.lower() in ["nan", "none"]:
+        return ""
+    
+    # 1. Remove standard word-bounded Open Location Codes (1 to 8 alphanumeric chars + '+' + 2 to 4 alphanumeric chars)
+    # Examples: 'H9P7+WGM', 'VW86+P6P', '4WJP+7C9', '9F29F2F+9V', '7632FHJJ+VX', '2222+22'
+    text = re.sub(r'\b[A-Za-z0-9]{1,8}\+[A-Za-z0-9]{2,4}\b', '', text)
+    
+    # 2. Remove uppercase plus codes attached to lowercase words (e.g. 'TelanganaG+94H' -> 'Telangana')
+    text = re.sub(r'(?<=[a-z])[A-Z0-9]{1,4}\+[A-Z0-9]{2,4}\b', '', text)
+    
+    # 3. Clean up commas, hyphens, and whitespace leftovers
+    text = re.sub(r'(\s*,\s*)+', ', ', text)
+    text = re.sub(r'(\s*-\s*)+', ' - ', text)
+    text = re.sub(r'^\s*[,;\-|\s]+', '', text)
+    text = re.sub(r'[,;\-|\s]+$', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+
+def extract_establishment_name(address: str) -> Optional[str]:
+    """Extracts establishment / hospital / clinic / nursing home prefix from address if available."""
+    if not address:
+        return None
+    match = re.match(
+        r'^([^,]+?(?:hospital|nursing home|clinic|centre|center|health care|maternity home|polyclinic|dispensary|care|institute))(?=[,\s]|$)',
+        address,
+        re.IGNORECASE
+    )
+    if match:
+        return match.group(1).strip()
+    first_clause = address.split(',')[0].strip()
+    if re.search(r'\b(hospital|nursing home|clinic|centre|center|polyclinic|dispensary|institute)\b', first_clause, re.IGNORECASE):
+        return first_clause
+    return None
+
+
+def extract_prominent_localities(address: str) -> List[str]:
+    """Extracts known locality and city tokens from address to validate against geocode results."""
+    tokens = [
+        'bhiwandi', 'kalyan', 'dombivli', 'thane', 'mumbra', 'ulhasnagar', 'ambarnath', 'badlapur',
+        'chembur', 'andheri', 'borivali', 'ghatkopar', 'kurla', 'mulund', 'dadar', 
+        'bandra', 'malad', 'kandivali', 'goregaon', 'jogeshwari', 'santacruz', 'vile parle',
+        'mira road', 'bhayandar', 'virar', 'vasai', 'kharghar', 'nerul', 'airoli', 'belapur',
+        'panvel', 'colaba', 'worli', 'parel', 'byculla', 'mahim', 'sion', 'matunga', 'wadala',
+        'dahisar', 'bhandup', 'kanjurmarg', 'vikhroli', 'vidyavihar', 'govandi', 'mankhurd',
+        'shahdara', 'rohini', 'dwarka', 'saket', 'janakpuri', 'kamla nagar', 'karol bagh', 'lajpat nagar',
+        'whitefield', 'indiranagar', 'hsr layout', 'koramangala', 'jayanagar', 'jp nagar', 'btm layout',
+        'rajajinagar', 'malleshwaram', 'banashankari', 'hebbal', 'yelahanka', 'electronic city',
+        'kothrud', 'hadapsar', 'wakad', 'hinjewadi', 'baner', 'aundh', 'viman nagar', 'kalyani nagar',
+        'lucknow', 'kanpur', 'varanasi', 'prayagraj', 'allahabad', 'agra', 'kolkata', 'howrah',
+        'delhi', 'noida', 'gurgaon', 'gurugram', 'ghaziabad', 'faridabad', 'patna', 'ranchi',
+        'bengaluru', 'bangalore', 'chennai', 'hyderabad', 'secunderabad', 'ahmedabad', 'surat', 'vadodara',
+        'pune', 'nagpur', 'nashik', 'aurangabad', 'kolhapur', 'solapur', 'amravati'
+    ]
+    addr_lower = address.lower()
+    found = [t for t in tokens if re.search(r'\b' + re.escape(t) + r'\b', addr_lower)]
+    return found
+
+
+def locality_matches_result(expected_tokens: List[str], formatted_address: str) -> bool:
+    """Verifies that formatted address returned by Google contains the expected locality if known."""
+    if not expected_tokens:
+        return True
+    fmt_lower = formatted_address.lower()
+    for token in expected_tokens:
+        if token in fmt_lower:
+            return True
+    return False
+
+
 def is_unwanted_pharmacy_entity(place_or_name) -> Tuple[bool, str]:
     """
     Identifies and filters non-pharmacy entities:
@@ -327,7 +458,7 @@ def is_unwanted_pharmacy_entity(place_or_name) -> Tuple[bool, str]:
         name = str(place_or_name).strip()
         types = set()
 
-    name = anyascii(name).strip()
+    name = clean_extracted_name(name)
     name_lower = name.lower()
 
     # 0. Reject Empty / Punctuation-only / Garbage / Dummy Placeholders (minimum 5 valid characters required)
@@ -424,79 +555,170 @@ class GoogleMapsEngine:
         self.telemetry = telemetry
         self.session = requests.Session()
 
+    def _query_single_geocode(self, query: str) -> Optional[Dict[str, Any]]:
+        """Queries SQLite cache or Google Geocoding API for a single query candidate."""
+        query = query.strip()
+        if not query:
+            return None
+
+        # Check SQLite Cache
+        cached = self.cache.get_geocode(query)
+        if cached and cached.get("lat") is not None:
+            self.telemetry.geocoding_cache_hits += 1
+            return cached
+
+        # Make Live API Call
+        self.telemetry.geocoding_api_calls += 1
+        url = "https://maps.googleapis.com/maps/api/geocode/json"
+        try:
+            res = self.session.get(url, params={"address": query, "language": "en", "key": self.api_key}, timeout=15).json()
+            status = res.get("status")
+            if status == "OK" and res.get("results"):
+                result = res["results"][0]
+                loc = result["geometry"]["location"]
+                formatted = result.get("formatted_address", "")
+
+                postal_code = None
+                city_found = None
+                for comp in result.get("address_components", []):
+                    types = comp.get("types", [])
+                    if "postal_code" in types:
+                        postal_code = comp.get("long_name")
+                    if "locality" in types or "administrative_area_level_2" in types:
+                        if not city_found:
+                            city_found = comp.get("long_name")
+
+                geo_data = {
+                    "lat": loc["lat"],
+                    "lng": loc["lng"],
+                    "formatted_address": formatted,
+                    "postal_code": postal_code or extract_indian_pincode(formatted) or "",
+                    "city": city_found or "",
+                    "status": "OK"
+                }
+                self.cache.save_geocode(query, geo_data)
+                self.telemetry.geocoding_successes += 1
+                return geo_data
+            elif status == "ZERO_RESULTS":
+                self.cache.save_geocode(query, {"status": "ZERO_RESULTS"})
+            else:
+                logger.warning(f"Geocoding API status '{status}' for: {query}")
+        except Exception as e:
+            logger.error(f"Geocoding error for '{query}': {e}")
+            time.sleep(0.5)
+
+        return None
+
     def geocode_doctor(self, doc_name: str, address: str, pincode: str, city: str) -> Optional[Dict[str, Any]]:
         """
-        Combines Doctor Name + Address + City + Pincode into search queries
-        and geocodes with intermediate caching.
+        Robust Dual-Anchor Geocoding System:
+        1. Formulates Physical Address Anchor queries (address, establishment, pincode, city)
+           to establish ground-truth physical premises coordinates.
+        2. Validates against expected locality tokens (e.g. Bhiwandi vs Kalyan).
+        3. Checks Doctor Entity query (doc_name + address/clinic) with Spatial Drift Guard.
+        4. If doctor query drifts > 350m away from the physical address anchor or conflicts
+           with locality, automatically rejects the drifted query and enforces the address anchor.
         """
-        # Formulate query candidates
-        clean_name = str(doc_name).strip()
-        clean_addr = str(address).strip()
-        clean_city = str(city).strip()
+        clean_name = clean_extracted_name(doc_name)
+        clean_addr = clean_extracted_name(address)
+        clean_city = clean_extracted_name(city)
         clean_pin = str(pincode).strip().replace(".0", "")
+        if clean_city.lower() in ["nan", "none"]:
+            clean_city = ""
+        if clean_pin.lower() in ["nan", "none"]:
+            clean_pin = ""
 
-        query_candidates = []
-        # 1. Primary Combined Query: Doctor Name + Address + City + PIN + India
-        p1 = [p for p in [clean_name, clean_addr, clean_city, clean_pin, "India"] if p and p.lower() != "nan"]
-        query_candidates.append(", ".join(p1))
+        expected_localities = extract_prominent_localities(clean_addr)
+        establishment = extract_establishment_name(clean_addr)
 
-        # 2. Secondary Query: Address + City + PIN + India (in case doctor name is unindexed)
-        p2 = [p for p in [clean_addr, clean_city, clean_pin, "India"] if p and p.lower() != "nan"]
-        query_candidates.append(", ".join(p2))
+        # -----------------------------------------------------
+        # Step 1: Establish Physical Address Anchor (Ground Truth)
+        # -----------------------------------------------------
+        addr_candidates = []
+        # 1. Full Address + City + Pincode
+        p_full = [p for p in [clean_addr, clean_city, clean_pin, "India"] if p]
+        addr_candidates.append(", ".join(p_full))
 
-        # 3. Tertiary Query: Address + City
-        p3 = [p for p in [clean_addr, clean_city, "India"] if p and p.lower() != "nan"]
-        query_candidates.append(", ".join(p3))
+        # 2. Full Address + Pincode (avoids conflicting parent metro names)
+        if clean_pin:
+            p_pin = [p for p in [clean_addr, clean_pin, "India"] if p]
+            addr_candidates.append(", ".join(p_pin))
 
-        for query in query_candidates:
-            # Check SQLite Cache
-            cached = self.cache.get_geocode(query)
-            if cached and cached.get("lat") is not None:
-                self.telemetry.geocoding_cache_hits += 1
-                return cached
+        # 3. Full Address + City
+        if clean_city:
+            p_city = [p for p in [clean_addr, clean_city, "India"] if p]
+            addr_candidates.append(", ".join(p_city))
 
-            # Make Live API Call
-            self.telemetry.geocoding_api_calls += 1
-            url = "https://maps.googleapis.com/maps/api/geocode/json"
-            try:
-                res = self.session.get(url, params={"address": query, "language": "en", "key": self.api_key}, timeout=15).json()
-                status = res.get("status")
-                if status == "OK" and res.get("results"):
-                    result = res["results"][0]
-                    loc = result["geometry"]["location"]
-                    formatted = result.get("formatted_address", "")
+        # 4. Full Address + India (bypasses conflicting pincode / city metadata)
+        addr_candidates.append(f"{clean_addr}, India")
 
-                    postal_code = None
-                    city_found = None
-                    for comp in result.get("address_components", []):
-                        types = comp.get("types", [])
-                        if "postal_code" in types:
-                            postal_code = comp.get("long_name")
-                        if "locality" in types or "administrative_area_level_2" in types:
-                            if not city_found:
-                                city_found = comp.get("long_name")
+        # 5. Establishment + Locality/City (if establishment extracted)
+        if establishment:
+            p_est = [p for p in [establishment, clean_city, clean_pin, "India"] if p]
+            addr_candidates.append(", ".join(p_est))
 
-                    geo_data = {
-                        "lat": loc["lat"],
-                        "lng": loc["lng"],
-                        "formatted_address": formatted,
-                        "postal_code": postal_code or extract_indian_pincode(formatted) or clean_pin,
-                        "city": city_found or clean_city,
-                        "status": "OK"
-                    }
-                    self.cache.save_geocode(query, geo_data)
-                    self.telemetry.geocoding_successes += 1
-                    return geo_data
-                elif status == "ZERO_RESULTS":
-                    self.cache.save_geocode(query, {"status": "ZERO_RESULTS"})
+        geo_anchor = None
+        for q in addr_candidates:
+            res = self._query_single_geocode(q)
+            if res and res.get("lat") is not None:
+                # If we have expected localities, verify that result does not conflict
+                if expected_localities:
+                    if locality_matches_result(expected_localities, res.get("formatted_address", "")):
+                        geo_anchor = res
+                        break
                 else:
-                    logger.warning(f"Geocoding API status '{status}' for: {query}")
-            except Exception as e:
-                logger.error(f"Geocoding error: {e}")
-                time.sleep(0.5)
+                    geo_anchor = res
+                    break
+
+        # Fallback if strict locality match was not hit
+        if not geo_anchor:
+            for q in addr_candidates:
+                res = self._query_single_geocode(q)
+                if res and res.get("lat") is not None:
+                    geo_anchor = res
+                    break
+
+        # -----------------------------------------------------
+        # Step 2: Formulate Doctor Entity Query (if name provided)
+        # -----------------------------------------------------
+        geo_entity = None
+        if clean_name:
+            entity_candidates = []
+            if establishment:
+                p_ne = [p for p in [clean_name, establishment, clean_city, clean_pin, "India"] if p]
+                entity_candidates.append(", ".join(p_ne))
+            p_na = [p for p in [clean_name, clean_addr, clean_city, clean_pin, "India"] if p]
+            entity_candidates.append(", ".join(p_na))
+
+            for q in entity_candidates:
+                res = self._query_single_geocode(q)
+                if res and res.get("lat") is not None:
+                    geo_entity = res
+                    break
+
+        # -----------------------------------------------------
+        # Step 3: Spatial Drift Resolution & Locality Verification
+        # -----------------------------------------------------
+        if geo_anchor and geo_entity:
+            dist = haversine_distance(geo_anchor["lat"], geo_anchor["lng"], geo_entity["lat"], geo_entity["lng"])
+            entity_locality_ok = locality_matches_result(expected_localities, geo_entity.get("formatted_address", ""))
+
+            if dist <= 350 and entity_locality_ok:
+                # Doctor entity query is hyper-local and agrees with locality -> Refined point
+                return geo_entity
+            else:
+                # Doctor entity drifted away (e.g. token collision or different branch)
+                self.telemetry.drift_detected_and_corrected += 1
+                logger.info(f"   [DRIFT GUARD] Doctor '{clean_name}' query drifted {dist:.1f}m away to '{geo_entity.get('formatted_address')}'. Enforcing physical address anchor: '{geo_anchor.get('formatted_address')}'.")
+                return geo_anchor
+        elif geo_anchor:
+            return geo_anchor
+        elif geo_entity:
+            return geo_entity
 
         self.telemetry.geocoding_failures += 1
         return None
+
 
     def search_nearby_pharmacies(self, lat: float, lng: float, radius: int = 300) -> List[Dict[str, Any]]:
         """Searches for pharmacies/chemists around coordinates using Places API."""
@@ -711,10 +933,10 @@ def run_unified_pipeline(
 
     for idx, (_, doc_row) in enumerate(df_doctors.iterrows(), 1):
         doc_id = str(doc_row.get("Doc ID", f"DOC_{idx}"))
-        doc_name = str(doc_row.get("DOCTOR NAME", "Unknown"))
-        doc_address = str(doc_row.get("Address", ""))
+        doc_name = clean_extracted_name(str(doc_row.get("DOCTOR NAME", "Unknown")))
+        doc_address = clean_extracted_name(str(doc_row.get("Address", "")))
         doc_pincode = str(doc_row.get("Pincode", "")).replace(".0", "")
-        doc_city = str(doc_row.get("Doctor City", "") or doc_row.get("City", "") or doc_row.get("CITY", "") or "").strip()
+        doc_city = clean_extracted_name(str(doc_row.get("Doctor City", "") or doc_row.get("City", "") or doc_row.get("CITY", "") or "")).strip()
         if doc_city.lower() in ["nan", "none"]:
             doc_city = ""
 
@@ -805,8 +1027,9 @@ def run_unified_pipeline(
 
         # Phase 5: Format Final Records
         for rank_idx, pharm in enumerate(top_matched, 1):
-            p_name = anyascii(pharm.get("name", "Unknown Pharmacy"))
-            p_address = anyascii(pharm.get("vicinity") or pharm.get("formatted_address", ""))
+            p_name = clean_extracted_name(pharm.get("name", "Unknown Pharmacy"))
+            p_address = clean_extracted_name(pharm.get("vicinity") or pharm.get("formatted_address", ""))
+            p_address_no_plus = remove_plus_codes(p_address)
             p_pin = extract_indian_pincode(p_address) or doc_pincode
             p_city = extract_city(p_address, fallback_city=doc_city)
             dist_m = pharm.get("road_distance_meters", 0)
@@ -824,6 +1047,7 @@ def run_unified_pipeline(
                 "Rank": rank_idx,
                 "Pharmacy Name": p_name,
                 "Pharmacy Address": p_address,
+                "Pharmacy Address (No Plus Code)": p_address_no_plus,
                 "Pharmacy Pincode": p_pin,
                 "Pharmacy City": p_city,
                 "Pharmacy Distance (meters)": dist_m,
@@ -904,6 +1128,7 @@ A. GEOCODING API:
    - Cache Hits (Reused from SQLite):       {telemetry.geocoding_cache_hits}
    - Geocoding Successes:                   {telemetry.geocoding_successes}
    - Geocoding Failures:                    {telemetry.geocoding_failures}
+   - Doctor Name Drifts Corrected:          {telemetry.drift_detected_and_corrected}
 
 B. PLACES API (Nearby Search - Multi-Tier Adaptive):
    - Fresh API Calls Made:                  {telemetry.places_api_calls}
