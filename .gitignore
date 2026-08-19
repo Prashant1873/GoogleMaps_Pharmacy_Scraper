@@ -16,9 +16,10 @@ cache.db
 *.sqlite3
 *.db
 
-# Intermediate Checkpoints & Output Logs
+# Intermediate Checkpoints, Outputs & Logs
 checkpoints/
 output/
+logs/
 *.log
 
 # OS generated files
@@ -31,4 +32,6 @@ final_doctor_nearest_*.csv
 *_matches.csv
 *_cleaned.xlsx
 summary_report*.txt
+test_verification_report_*
+
 

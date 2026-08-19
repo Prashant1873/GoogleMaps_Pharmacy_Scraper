@@ -21,16 +21,28 @@ Built with persistent caching, adaptive radius expansion, walking route calculat
 ## 📁 Repository Structure
 
 ```text
+GOOGLEMAPS/
+├── data/                                        # Input datasets & templates
+│   └── All_doctors.xlsx                         # Master doctor dataset / template
+├── output/                                      # Generated reports & exports (git-ignored)
+│   ├── final_doctor_nearest_5_chemists_*.xlsx   # Final matched Excel report
+│   ├── final_doctor_nearest_5_chemists_*.csv    # Final matched CSV report
+│   ├── summary_report_*.txt                     # Telemetry & cost estimation report
+│   └── test_verification_report_*.xlsx/.csv     # Reverse verification audit logs
+├── logs/                                        # Execution log files (git-ignored)
+│   ├── pipeline_execution.log
+│   ├── chemist_finder.log
+│   └── verification_test.log
+├── checkpoints/                                 # Intermediate geocoding checkpoints (git-ignored)
+│   └── intermediate_geocoded_doctors_*.xlsx
 ├── run_pipeline.py                              # Main end-to-end matching pipeline
 ├── find_chemists.py                             # Core proximity & pharmacy search module
-├── test_api_key.py                              # Verification script for Google Maps APIs
-├── summary_report.txt                           # Sample telemetry and execution report
+├── verify_reverse_matching.py                   # Reverse verification & audit script
+├── test_api_key.py                              # Diagnostic & API key verification script
 ├── requirements.txt                             # Python dependencies
 ├── .env.example                                 # Environment variable template
 ├── .gitignore                                   # Git exclusion rules
-├── All_doctors.xlsx                             # Input dataset template
-├── final_doctor_nearest_5_chemists.xlsx         # Final matched Excel report
-└── final_doctor_nearest_5_chemists_matches.csv  # Final matched CSV report
+└── README.md                                    # Project documentation
 ```
 
 ---
@@ -92,32 +104,68 @@ python test_api_key.py
 
 ### Running the Full Matching Pipeline
 
-To process doctor records from an Excel file:
+To process doctor records from the master Excel file:
 
 ```bash
-python run_pipeline.py --input All_doctors.xlsx --output final_doctor_nearest_5_chemists.xlsx
+# Runs pipeline on data/All_doctors.xlsx and exports to output/
+python run_pipeline.py
+```
+
+Or specify custom inputs and outputs:
+
+```bash
+python run_pipeline.py --input data/All_doctors.xlsx --output output/final_doctor_nearest_5_chemists.xlsx
 ```
 
 #### Available CLI Arguments:
 
 | Argument | Description | Default |
 | :--- | :--- | :--- |
-| `--input` | Path to the source Excel file containing doctor addresses | `All_doctors.xlsx` |
-| `--output` | Output filename for the final matched Excel report | `final_doctor_nearest_5_chemists.xlsx` |
+| `--input` | Path to the source Excel file containing doctor addresses | `data/All_doctors.xlsx` |
+| `--output` | Output filename for the final matched Excel report | `output/final_doctor_nearest_5_chemists.xlsx` |
+| `--summary` | Output filename for telemetry summary report | `output/summary_report.txt` |
 | `--radius` | Initial search radius in meters (walking distance) | `300` |
 | `--max-radius` | Maximum search radius in meters to expand until target chemists found | `10000` |
 | `--target-count`| Target number of nearest pharmacies to find per doctor | `5` |
 | `--limit` | Optional limit on number of doctors to process | `None` (all) |
+| `--verify` | Run reverse verification test on random sample after matching | `False` |
+| `--verify-samples` | Number of samples for verification test | `200` |
+
+---
+
+### Running the Reverse Doctor-Pharmacy Verification Test
+
+To independently test mapping accuracy, the verification module randomly samples 200 entries from your latest result sheet in `output/`, locates each pharmacy on Google Maps, performs a reverse search for nearby healthcare providers, and verifies the mapped doctor's presence:
+
+```bash
+# Auto-detects the latest result in output/ and tests 200 random entries
+python verify_reverse_matching.py --sample-size 200
+
+# Or run with a custom result file and seed:
+python verify_reverse_matching.py --results output/final_doctor_nearest_5_chemists_20260819_182324.xlsx --sample-size 200 --seed 42
+```
+
+#### Verification CLI Arguments:
+
+| Argument | Description | Default |
+| :--- | :--- | :--- |
+| `--results` | Path to result Excel or CSV file | Auto-detects latest in `output/` |
+| `--sample-size` | Number of random entries to test | `200` |
+| `--seed` | Random seed for reproducible sampling | `None` (random) |
+| `--radius` | Base search radius in meters around pharmacy | `600` |
+| `--threshold` | Fuzzy matching confidence threshold (0.0 - 1.0) | `0.75` |
+| `--output` | Custom path for verification audit Excel report | `output/test_verification_report_*.xlsx` |
 
 ---
 
 ## 📊 Pipeline Telemetry & Summary Report
 
-Every pipeline run automatically records detailed performance metrics into `summary_report.txt` and `pipeline_execution.log`, including:
+Every pipeline run automatically records detailed performance metrics into `output/summary_report_*.txt` and `logs/pipeline_execution.log`, including:
 
 - **Doctor Processing Statistics**: Total records processed and match completion rates.
 - **Cache Hit vs. Fresh API Call Breakdown**: Quantified stats for Geocoding, Places, and Distance Matrix calls.
 - **Estimated API Costs**: Real-time gross billable amount vs. Google Cloud Monthly Free Tier allowance.
+- **Verification Audit Reports**: Detailed sample-by-sample verification logs (`output/test_verification_report_*.xlsx` and `.csv`) detailing match confidence scores, match types, and success percentage.
 
 ---
 
@@ -125,3 +173,5 @@ Every pipeline run automatically records detailed performance metrics into `summ
 
 - Never commit your `.env` file containing actual Google Cloud API keys.
 - Keep the local SQLite database (`cache.db`) protected to leverage cached queries across runs.
+
+

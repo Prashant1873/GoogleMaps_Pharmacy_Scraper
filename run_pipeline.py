@@ -44,15 +44,17 @@ def load_api_key() -> str:
     return api_key
 
 # Configure Logging
+os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("pipeline_execution.log", encoding="utf-8")
+        logging.FileHandler(os.path.join("logs", "pipeline_execution.log"), encoding="utf-8")
     ]
 )
 logger = logging.getLogger("ChemistPipeline")
+
 
 
 # ---------------------------------------------------------
@@ -300,28 +302,55 @@ def extract_indian_pincode(text: str) -> Optional[str]:
     matches = re.findall(r'\b[1-9][0-9]{5}\b', str(text))
     return matches[-1] if matches else None
 
+def resolve_input_file(input_file: str) -> str:
+    """Resolves input file path, checking data/ directory if not found directly."""
+    if os.path.exists(input_file):
+        return input_file
+    candidates = [
+        os.path.join("data", input_file),
+        os.path.join("data", os.path.basename(input_file)),
+        os.path.basename(input_file),
+        os.path.join("data", "All_doctors.xlsx"),
+        "All_doctors.xlsx"
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return input_file
+
+
 def cleanup_old_results(base_dir: str = ".") -> List[str]:
     """
     Deletes all previous run result files and checkpoints before starting a new run.
     Cleans:
+    - output/final_doctor_nearest_*.xlsx / output/final_doctor_nearest_*.csv
+    - output/summary_report*.txt
     - final_doctor_nearest_*.xlsx / final_doctor_nearest_*.csv
     - summary_report*.txt
     - checkpoints/*.xlsx / checkpoints/*.json
     """
     patterns = [
+        os.path.join(base_dir, "output", "final_doctor_nearest_*.xlsx"),
+        os.path.join(base_dir, "output", "final_doctor_nearest_*.csv"),
+        os.path.join(base_dir, "output", "summary_report*.txt"),
         os.path.join(base_dir, "final_doctor_nearest_*.xlsx"),
         os.path.join(base_dir, "final_doctor_nearest_*.csv"),
         os.path.join(base_dir, "summary_report*.txt"),
         os.path.join(base_dir, "checkpoints", "*.xlsx"),
         os.path.join(base_dir, "checkpoints", "*.json"),
+        os.path.join("output", "final_doctor_nearest_*.xlsx"),
+        os.path.join("output", "final_doctor_nearest_*.csv"),
+        os.path.join("output", "summary_report*.txt"),
+        os.path.join("checkpoints", "*.xlsx"),
+        os.path.join("checkpoints", "*.json"),
     ]
-    deleted_files = []
+    deleted_files = set()
     for pattern in patterns:
         for filepath in glob.glob(pattern):
             try:
                 if os.path.isfile(filepath):
                     os.remove(filepath)
-                    deleted_files.append(filepath)
+                    deleted_files.add(filepath)
             except Exception as e:
                 logger.warning(f"Could not delete old file {filepath}: {e}")
     
@@ -329,7 +358,7 @@ def cleanup_old_results(base_dir: str = ".") -> List[str]:
         logger.info(f"Cleaned up {len(deleted_files)} old result/checkpoint file(s): {[os.path.basename(f) for f in deleted_files]}")
     else:
         logger.info("No old result files found to clean.")
-    return deleted_files
+    return list(deleted_files)
 
 
 def extract_city(address: str, fallback_city: str = "") -> str:
@@ -1108,9 +1137,9 @@ def get_adaptive_radius_steps(base_radius: int = 300, max_radius: int = 10000) -
 # Unified Pipeline Runner
 # ---------------------------------------------------------
 def run_unified_pipeline(
-    input_file: str = "All_doctors.xlsx",
-    output_excel: str = "final_doctor_nearest_5_chemists.xlsx",
-    summary_txt: str = "summary_report.txt",
+    input_file: str = "data/All_doctors.xlsx",
+    output_excel: str = "output/final_doctor_nearest_5_chemists.xlsx",
+    summary_txt: str = "output/summary_report.txt",
     limit: Optional[int] = None,
     base_radius: int = 300,
     max_radius: int = 10000,
@@ -1122,6 +1151,8 @@ def run_unified_pipeline(
     telemetry = Telemetry()
     telemetry.start()
 
+    input_file = resolve_input_file(input_file)
+
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if use_timestamp:
         output_excel = add_timestamp(output_excel, run_timestamp)
@@ -1130,10 +1161,18 @@ def run_unified_pipeline(
     else:
         geocoded_master_path = os.path.join("checkpoints", "intermediate_geocoded_doctors.xlsx")
 
+    # Ensure target directories exist
+    out_dir = os.path.dirname(os.path.abspath(output_excel))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    sum_dir = os.path.dirname(os.path.abspath(summary_txt))
+    if sum_dir:
+        os.makedirs(sum_dir, exist_ok=True)
     os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
 
     # Clean up previous run result files and checkpoints before starting a new run
-    cleanup_old_results(base_dir=os.path.dirname(os.path.abspath(output_excel)) or ".")
+    cleanup_old_results(base_dir=".")
 
     logger.info("=================================================================")
     logger.info("STARTING UNIFIED DOCTOR-PHARMACY PIPELINE")
@@ -1396,6 +1435,7 @@ YOUR NET OUT-OF-POCKET EXPENSE:             ₹0.00 (100% FREE)
     except UnicodeEncodeError:
         print("\n" + report_text.encode("ascii", "replace").decode("ascii"))
 
+    return saved_excel_path
 
 
 # ---------------------------------------------------------
@@ -1403,18 +1443,20 @@ YOUR NET OUT-OF-POCKET EXPENSE:             ₹0.00 (100% FREE)
 # ---------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unified Google Maps Doctor-Chemist Matcher")
-    parser.add_argument("--input", default="All_doctors.xlsx", help="Input Excel path")
-    parser.add_argument("--output", default="final_doctor_nearest_5_chemists.xlsx", help="Output Excel path")
-    parser.add_argument("--summary", default="summary_report.txt", help="Summary report TXT path")
+    parser.add_argument("--input", default="data/All_doctors.xlsx", help="Input Excel path (default: data/All_doctors.xlsx)")
+    parser.add_argument("--output", default="output/final_doctor_nearest_5_chemists.xlsx", help="Output Excel path (default: output/final_doctor_nearest_5_chemists.xlsx)")
+    parser.add_argument("--summary", default="output/summary_report.txt", help="Summary report TXT path (default: output/summary_report.txt)")
     parser.add_argument("--limit", type=int, default=None, help="Process first N doctors (optional)")
     parser.add_argument("--radius", type=int, default=300, help="Initial search radius in meters (default: 300)")
     parser.add_argument("--max-radius", type=int, default=10000, help="Maximum search radius in meters (default: 10000)")
     parser.add_argument("--target-count", type=int, default=5, help="Target number of pharmacies per doctor (default: 5)")
     parser.add_argument("--no-timestamp", action="store_true", help="Disable automatic timestamp suffix on output file names")
+    parser.add_argument("--verify", action="store_true", help="Run reverse verification test on 200 random entries after matching completes")
+    parser.add_argument("--verify-samples", type=int, default=200, help="Number of random samples for verification (default: 200)")
 
     args = parser.parse_args()
 
-    run_unified_pipeline(
+    saved_output = run_unified_pipeline(
         input_file=args.input,
         output_excel=args.output,
         summary_txt=args.summary,
@@ -1424,3 +1466,15 @@ if __name__ == "__main__":
         target_count=args.target_count,
         use_timestamp=not args.no_timestamp
     )
+
+    if args.verify and saved_output:
+        try:
+            from verify_reverse_matching import run_reverse_verification_test
+            logger.info("\n--- Starting Post-Pipeline Reverse Verification Test ---")
+            run_reverse_verification_test(
+                result_file=saved_output,
+                sample_size=args.verify_samples
+            )
+        except Exception as e:
+            logger.error(f"Error executing verification test: {e}")
+

@@ -41,12 +41,13 @@ def load_api_key() -> str:
     return api_key
 
 # Configure Logging
+os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("chemist_finder.log", encoding="utf-8")
+        logging.FileHandler(os.path.join("logs", "chemist_finder.log"), encoding="utf-8")
     ]
 )
 logger = logging.getLogger("ChemistFinder")
@@ -226,28 +227,55 @@ def extract_indian_pincode(text: str) -> Optional[str]:
     matches = re.findall(r'\b[1-9][0-9]{5}\b', str(text))
     return matches[-1] if matches else None
 
+def resolve_input_file(input_file: str) -> str:
+    """Resolves input file path, checking data/ directory if not found directly."""
+    if os.path.exists(input_file):
+        return input_file
+    candidates = [
+        os.path.join("data", input_file),
+        os.path.join("data", os.path.basename(input_file)),
+        os.path.basename(input_file),
+        os.path.join("data", "All_doctors.xlsx"),
+        "All_doctors.xlsx"
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return input_file
+
+
 def cleanup_old_results(base_dir: str = ".") -> List[str]:
     """
     Deletes all previous run result files and checkpoints before starting a new run.
     Cleans:
+    - output/final_doctor_nearest_*.xlsx / output/final_doctor_nearest_*.csv
+    - output/summary_report*.txt
     - final_doctor_nearest_*.xlsx / final_doctor_nearest_*.csv
     - summary_report*.txt
     - checkpoints/*.xlsx / checkpoints/*.json
     """
     patterns = [
+        os.path.join(base_dir, "output", "final_doctor_nearest_*.xlsx"),
+        os.path.join(base_dir, "output", "final_doctor_nearest_*.csv"),
+        os.path.join(base_dir, "output", "summary_report*.txt"),
         os.path.join(base_dir, "final_doctor_nearest_*.xlsx"),
         os.path.join(base_dir, "final_doctor_nearest_*.csv"),
         os.path.join(base_dir, "summary_report*.txt"),
         os.path.join(base_dir, "checkpoints", "*.xlsx"),
         os.path.join(base_dir, "checkpoints", "*.json"),
+        os.path.join("output", "final_doctor_nearest_*.xlsx"),
+        os.path.join("output", "final_doctor_nearest_*.csv"),
+        os.path.join("output", "summary_report*.txt"),
+        os.path.join("checkpoints", "*.xlsx"),
+        os.path.join("checkpoints", "*.json"),
     ]
-    deleted_files = []
+    deleted_files = set()
     for pattern in patterns:
         for filepath in glob.glob(pattern):
             try:
                 if os.path.isfile(filepath):
                     os.remove(filepath)
-                    deleted_files.append(filepath)
+                    deleted_files.add(filepath)
             except Exception as e:
                 logger.warning(f"Could not delete old file {filepath}: {e}")
     
@@ -255,7 +283,7 @@ def cleanup_old_results(base_dir: str = ".") -> List[str]:
         logger.info(f"Cleaned up {len(deleted_files)} old result/checkpoint file(s): {[os.path.basename(f) for f in deleted_files]}")
     else:
         logger.info("No old result files found to clean.")
-    return deleted_files
+    return list(deleted_files)
 
 
 def extract_city(address: str, fallback_city: str = "") -> str:
@@ -1101,8 +1129,8 @@ def find_top_pharmacies_for_doctor(
 # Batch Processor & Checkpointing
 # ---------------------------------------------------------
 def process_doctor_file(
-    input_file: str,
-    output_excel: str = "final_doctor_nearest_5_chemists.xlsx",
+    input_file: str = "data/All_doctors.xlsx",
+    output_excel: str = "output/final_doctor_nearest_5_chemists.xlsx",
     api_key: str = "",
     limit: Optional[int] = None,
     base_radius: int = 300,
@@ -1111,15 +1139,23 @@ def process_doctor_file(
     mode: str = "walking",
     use_timestamp: bool = True
 ):
+    input_file = resolve_input_file(input_file)
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if use_timestamp:
         output_excel = add_timestamp(output_excel, run_timestamp)
-        checkpoint_file = add_timestamp("checkpoints/checkpoint_data.json", run_timestamp)
+        checkpoint_file = add_timestamp(os.path.join("checkpoints", "checkpoint_data.json"), run_timestamp)
     else:
-        checkpoint_file = "checkpoints/checkpoint_data.json"
+        checkpoint_file = os.path.join("checkpoints", "checkpoint_data.json")
+
+    # Ensure target directories exist
+    out_dir = os.path.dirname(os.path.abspath(output_excel))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
 
     # Clean up previous run result files and checkpoints before starting a new run
-    cleanup_old_results(base_dir=os.path.dirname(os.path.abspath(output_excel)) or ".")
+    cleanup_old_results(base_dir=".")
 
     logger.info(f"Starting Doctor-Pharmacy Matching Pipeline...")
     logger.info(f"Input File: {input_file}")
@@ -1256,8 +1292,8 @@ def process_doctor_file(
 # ---------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find closest pharmacies per doctor using Google Maps API")
-    parser.add_argument("--input", default="All_doctors.xlsx", help="Path to input Excel file")
-    parser.add_argument("--output", default="final_doctor_nearest_5_chemists.xlsx", help="Path to output Excel file")
+    parser.add_argument("--input", default="data/All_doctors.xlsx", help="Path to input Excel file (default: data/All_doctors.xlsx)")
+    parser.add_argument("--output", default="output/final_doctor_nearest_5_chemists.xlsx", help="Path to output Excel file (default: output/final_doctor_nearest_5_chemists.xlsx)")
     parser.add_argument("--key", default="", help="Google Maps API Key (optional, defaults to .env)")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit for testing (e.g. --limit 5)")
     parser.add_argument("--radius", type=int, default=300, help="Initial search radius in meters (default: 300)")
