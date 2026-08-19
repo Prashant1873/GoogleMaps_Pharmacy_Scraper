@@ -403,6 +403,30 @@ def extract_establishment_name(address: str) -> Optional[str]:
     return None
 
 
+def format_doctor_name_for_query(raw_name: str) -> str:
+    """
+    Normalizes and formats doctor name for Google Maps entity search.
+    Ensures a clean 'Dr. ' prefix for individual practitioners while
+    preventing duplicate prefixes (e.g. 'Dr. Dr.') and skipping institutions.
+    """
+    if not raw_name:
+        return ""
+    clean = clean_extracted_name(raw_name)
+    if not clean or clean.lower() in ["nan", "none"]:
+        return ""
+    
+    # If the name is an institution/clinic/hospital rather than an individual doctor, leave as is
+    if re.search(r'\b(hospital|nursing home|clinic|centre|center|polyclinic|dispensary|trust|institute|lab|laboratory|diagnostics?)\b', clean, re.IGNORECASE):
+        return clean
+
+    # Strip any existing variations of doctor/prof prefix
+    stripped = re.sub(r'^(dr\.?|doctor|prof\.?|professor)\s*', '', clean, flags=re.IGNORECASE).strip()
+    if not stripped:
+        return clean
+    
+    return f"Dr. {stripped}"
+
+
 def extract_prominent_localities(address: str) -> List[str]:
     """Extracts known locality and city tokens from address to validate against geocode results."""
     tokens = [
@@ -682,13 +706,22 @@ class GoogleMapsEngine:
         # Step 2: Formulate Doctor Entity Query (if name provided)
         # -----------------------------------------------------
         geo_entity = None
-        if clean_name:
+        query_doc_name = format_doctor_name_for_query(clean_name)
+        if query_doc_name:
             entity_candidates = []
             if establishment:
-                p_ne = [p for p in [clean_name, establishment, clean_city, clean_pin, "India"] if p]
+                p_ne = [p for p in [query_doc_name, establishment, clean_city, clean_pin, "India"] if p]
                 entity_candidates.append(", ".join(p_ne))
-            p_na = [p for p in [clean_name, clean_addr, clean_city, clean_pin, "India"] if p]
+            p_na = [p for p in [query_doc_name, clean_addr, clean_city, clean_pin, "India"] if p]
             entity_candidates.append(", ".join(p_na))
+            
+            # Fallback to un-prefixed name if different
+            if clean_name and clean_name != query_doc_name:
+                if establishment:
+                    p_ne_raw = [p for p in [clean_name, establishment, clean_city, clean_pin, "India"] if p]
+                    entity_candidates.append(", ".join(p_ne_raw))
+                p_na_raw = [p for p in [clean_name, clean_addr, clean_city, clean_pin, "India"] if p]
+                entity_candidates.append(", ".join(p_na_raw))
 
             for q in entity_candidates:
                 res = self._query_single_geocode(q)
