@@ -796,8 +796,10 @@ def locality_matches_result(expected_tokens: List[str], formatted_address: str) 
 def is_unwanted_pharmacy_entity(place_or_name) -> Tuple[bool, str]:
     """
     Identifies and filters non-pharmacy entities:
-    - Clinics, Doctors, Polyclinics, Dispensaries, OPDs
     - Diagnostic centers, Pathology Labs, Blood collection centres, Imaging/Scans
+    - Famous Pathology & Diagnostic Chains (Metropolis, Dr Lal Pathlabs, Thyrocare, SRL/Agilus, Redcliffe, etc.)
+    - Corporate Healthcare Manufacturers & B2B Wholesalers (without retail pharmacy)
+    - Clinics, Doctors, Polyclinics, Dispensaries, OPDs, Individual Practices
     - Surgical suppliers & equipment
     - Enterprises, B2B Distributors, Wholesale Agencies, Trading, Corporate, Marketing, Agro, Chemicals
     - Banking, ATMs, Financial kiosks
@@ -850,11 +852,56 @@ def is_unwanted_pharmacy_entity(place_or_name) -> Tuple[bool, str]:
     if re.search(r"^(bank of|state bank|canara bank|hdfc|icici|sbi|axis bank|punjab national bank|union bank|bank|atm)\b", name_lower):
         return True, "Keyword: Bank/ATM"
 
-    # 5. Clinics, Polyclinics, Dispensaries, OPDs, Counselling & Consulting
+    # 5. Diagnostic Centers, Pathology Labs, Blood Collection, Imaging & Major Pathology Chains
+    # A. Major Pathology & Diagnostic Chain Brands
+    if re.search(
+        r"\b(metropolis|lal\s*path\s*labs?|lal\s*pathlabs?|dr\s*\.?\s*lal\s*path|path\s*labs?|pathlabs?|"
+        r"thyrocare|agilus|srl\s*(?:diagnostics|labs?|limited|ltd)?|redcliffe|suburban\s*diagnostics|suburban\s*labs?|"
+        r"pathkind|neuberg|healthians|oncquest|krsnaa|hindlabs|core\s*diagnostics|lifecell|"
+        r"medcis|tenet\s*diagnostics|lucid\s*diagnostics|ehrlich\s*(?:laboratory|diagnostics)|"
+        r"medall\s*(?:healthcare|diagnostics)|aarthi\s*scans?|anand\s*diagnostic|genes2me|medgenome|"
+        r"mapmygenome|dr\s*\.?\s*remedies\s*labs?|max\s*lab)\b",
+        name_lower
+    ):
+        return True, "Keyword: Pathology/Diagnostic Brand"
+
+    # B. Generic Pathology, Diagnostic, Laboratory, Blood & Imaging Keywords
+    if re.search(
+        r"\b(patholog(?:y|ies|ist|ists|ical)|path\s*-\s*labs?|path\s*labs?|pathlabs?|pathcare|path\s*care|pathkind|"
+        r"diagnost(?:ic|ics|ix|ica|centre|center)|radiolog(?:y|ist|ists|ical)|radiodiagnost(?:ic|ics)|"
+        r"laborator(?:y|ies)|laboratoire|"
+        r"blood\s*(?:collection|bank|collector|sample|testing|test|tests)|sample\s*collection|specimen\s*collection|"
+        r"phlebotomy|test\s*(?:centre|center|ing\s*lab)|health\s*check\s*up|"
+        r"imaging|scans?|scanning|x\s*-?\s*rays?|mri|ct\s*-?\s*scans?|cat\s*scans?|"
+        r"ultrasound|ultra\s*-?\s*sound|sonograph(?:y|ic)|ultrasonograph(?:y|ic)|echocardiograph(?:y|ic)|"
+        r"mammograph(?:y|ic)|endoscop(?:y|ic)|colonoscop(?:y|ic)|dexa\s*scan)\b",
+        name_lower
+    ):
+        return True, "Keyword: Diagnostic/Pathology/Lab/Blood/Scan"
+
+    # C. Standalone Lab / Labs / Microlab (excluding Zeelab retail pharmacy unless explicit lab)
+    if re.search(r"\b(bio|micro|patho|immuno|histo|gen|onco|neuro|hemo|haemo|diagnolab|clinical|research)?\s*labs?\b", name_lower):
+        if "zeelab" not in name_lower:
+            return True, "Keyword: Lab/Laboratory"
+
+    # 6. Corporate Healthcare, B2B Pharma Manufacturers, Lifesciences Entities without Retail Pharmacy
+    if re.search(
+        r"\b(?:healthcare|health\s*care|lifesciences|life\s*sciences|therapeutics|biotech|biotechnology|"
+        r"pharma|pharmaceuticals?)\s*(?:pvt\s*\.?\s*ltd|private\s*limited|ltd\b|limited\b|llp\b|inc\b|corp\b|corporation\b)",
+        name_lower
+    ):
+        has_retail_marker = bool(re.search(
+            r"\b(pharmacy|chemist|medical\s*store|medicals|medicos|druggist|drug\s*store|aushadhi|dawakhana|dawa\s*bazar)\b",
+            name_lower
+        ))
+        if not has_retail_marker:
+            return True, "Keyword: Corporate Healthcare/Pharma (Non-Retail)"
+
+    # 7. Clinics, Polyclinics, Dispensaries, OPDs, Counselling & Consulting
     if re.search(r"\b(clinic|clinics|polyclinic|polyclinics|smartclinic|dispensary|dispensaries|counselling|consulting|consultant|consultants|consultancy|opd|sevadham|care clinic)\b", name_lower):
         return True, "Keyword: Clinic/Polyclinic/Dispensary"
 
-    # 6. Doctors, Physicians, Surgeons & Individual Practices
+    # 8. Doctors, Physicians, Surgeons & Individual Practices
     if re.search(r"\b(doctor|doctors|physician|physicians|surgeon|surgeons)\b", name_lower):
         return True, "Keyword: Doctor/Physician/Surgeon"
     if re.search(r"\b(prof\.|professor)\s*dr\b", name_lower):
@@ -867,31 +914,27 @@ def is_unwanted_pharmacy_entity(place_or_name) -> Tuple[bool, str]:
         else:
             return True, "Keyword: Doctor Practice/Name"
 
-    # 7. Diagnostic Centers, Pathology Labs, Blood Collection & Imaging
-    if re.search(r"\b(diagnostic|diagnostics|laboratory|laboratories|lab|labs|pathology|pathlab|pathlabs|blood collection|blood bank|sample collection|imaging|scan|scans|ultrasound|x-ray|xray|mri|ecg|test centre|test center|path care)\b", name_lower):
-        return True, "Keyword: Diagnostic/Lab/Blood Collection"
-
-    # 8. Surgical Equipment & Supplies
+    # 9. Surgical Equipment & Supplies
     if re.search(r"\b(surgical|surgicals|surgery|surgico|surgi)\b", name_lower):
         return True, "Keyword: Surgical"
 
-    # 9. Enterprises, Wholesale Agencies, Distributors, B2B, Industrial, Agro, Chemicals, Non-pharma Retail
+    # 10. Enterprises, Wholesale Agencies, Distributors, B2B, Industrial, Agro, Chemicals, Non-pharma Retail
     if re.search(r"\b(enterprise|enterprises|agency|agencies|distributor|distributors|wholesaler|wholesalers|supplier|suppliers|exports|imports|trader|traders|trading|corporation|associates|kiosk|telecom|recharge|xerox|printers|travels|courier|logistics|marketing|machinery|packaging|software|technologies|properties|realtors|jewellers|jewellery|garments|textiles|stationery|agro|chemicals|chemical|scientific|equipment)\b", name_lower):
         return True, "Keyword: Enterprise/Agency/Distributor/Wholesale"
 
-    # 10. Homeopathy, Ayurveda, Unani, Siddha, Naturopathy & Herbal
+    # 11. Homeopathy, Ayurveda, Unani, Siddha, Naturopathy & Herbal
     if re.search(r"\b(homeo|homoeo|homeopathy|homoeopathy|homeopathic|homoeopathic|ayurved|ayurveda|ayurvedic|ayur|unani|siddha|naturopathy|herbal|patanjali|baidyanath|dabur|himalaya store|hamdard|tibbi|zandu)\b", name_lower):
         return True, "Keyword: Homeopathy/Ayurveda/Alternative"
 
-    # 11. Dental, Optical, Vision & Eyewear
+    # 12. Dental, Optical, Vision & Eyewear
     if re.search(r"\b(dental|dentist|dentistry|dento|tooth|teeth|opticals|optical|optician|opticians|spectacles|lens|eyewear|vision care|eye care|eye hospital|lenskart)\b", name_lower):
         return True, "Keyword: Dental/Optical"
 
-    # 12. Nursing Staff at Home / Home Healthcare
+    # 13. Nursing Staff at Home / Home Healthcare
     if re.search(r"\b(nursing staff|nursing care|home health care|home nursing|nursing service|attendant)\b", name_lower):
         return True, "Keyword: Nursing Staff / Home Care"
 
-    # 13. Standalone Hospital / Medical College / Nursing Home
+    # 14. Standalone Hospital / Medical College / Nursing Home
     if re.search(r"\b(hospital|hospitals|nursing home|maternity home|medical college)\b", name_lower):
         if not re.search(r"\b(pharmacy|chemist|medical|medicals|medicos|druggist|drug store|aushadhi)\b", name_lower):
             return True, "Keyword: Standalone Hospital/Nursing Home"
