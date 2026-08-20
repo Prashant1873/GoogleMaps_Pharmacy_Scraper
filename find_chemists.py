@@ -16,6 +16,7 @@ import glob
 from typing import Dict, List, Any, Optional, Tuple
 from urllib.parse import quote_plus
 from datetime import datetime
+from difflib import SequenceMatcher
 
 import pandas as pd
 import requests
@@ -192,6 +193,250 @@ class CacheManager:
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (cache_key, data.get("distance_meters"), data.get("distance_text"), data.get("duration_seconds"), data.get("duration_text"), data.get("status")))
             conn.commit()
+
+
+# ---------------------------------------------------------
+# IQVIA Chemist Master Manager & Entity Resolution
+# ---------------------------------------------------------
+class ChemistMasterManager:
+    """
+    Manages high-speed SQLite indexing and entity resolution for master
+    chemist records from Chemist_HCM.xlsx to maintain official IQVIA IDs.
+    """
+    def __init__(self, excel_path: str = "Chemist_HCM.xlsx", db_path: str = "cache.db"):
+        self.excel_path = excel_path
+        self.db_path = db_path
+        self._init_db()
+        self._ensure_loaded()
+
+    def _get_conn(self):
+        return sqlite3.connect(self.db_path, timeout=30.0)
+
+    def _init_db(self):
+        with self._get_conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS iqvia_chemists_master (
+                    iqvia_id TEXT PRIMARY KEY,
+                    chem_name TEXT,
+                    chem_name_clean TEXT,
+                    chem_address TEXT,
+                    chem_city TEXT,
+                    chem_city_norm TEXT,
+                    chem_state TEXT,
+                    chem_pincode TEXT,
+                    chem_pincode_clean TEXT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_iqvia_pincode ON iqvia_chemists_master(chem_pincode_clean);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_iqvia_city ON iqvia_chemists_master(chem_city_norm);")
+            conn.commit()
+
+    def _ensure_loaded(self):
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM iqvia_chemists_master")
+            count = cur.fetchone()[0]
+            if count > 0:
+                return
+
+        # Attempt to find Chemist_HCM.xlsx
+        target_path = self.excel_path
+        if not os.path.exists(target_path):
+            candidates = [
+                os.path.join("data", "Chemist_HCM.xlsx"),
+                os.path.join("data", "chemist_HCM.xlsx"),
+                "chemist_HCM.xlsx",
+                "Chemist_HCM.xlsx"
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    target_path = c
+                    break
+
+        if not os.path.exists(target_path):
+            logger.warning(f"Chemist Master file not found at {self.excel_path}. IQVIA resolution will be skipped.")
+            return
+
+        logger.info(f"Indexing master chemist dataset from {target_path} into SQLite cache...")
+        try:
+            df = pd.read_excel(target_path)
+            records = []
+            for _, r in df.iterrows():
+                iq_id = str(r.get("IQVIA ID", "")).strip()
+                c_name = str(r.get("chem_name", "") if pd.notna(r.get("chem_name")) else "").strip()
+                c_addr = str(r.get("chem_address", "") if pd.notna(r.get("chem_address")) else "").strip()
+                c_city = str(r.get("chem_city", "") if pd.notna(r.get("chem_city")) else "").strip()
+                c_state = str(r.get("chem_state", "") if pd.notna(r.get("chem_state")) else "").strip()
+                c_pin = str(r.get("chem_pincode", "") if pd.notna(r.get("chem_pincode")) else "").replace(".0", "").strip()
+
+                c_name_clean = re.sub(r"[^a-z0-9\s]", " ", c_name.lower()).strip()
+                c_city_norm = re.sub(r"[^a-z0-9\s]", " ", c_city.lower()).strip()
+                pin_match = re.search(r"(\d{6})", c_pin)
+                c_pin_clean = pin_match.group(1) if pin_match else c_pin
+
+                records.append((iq_id, c_name, c_name_clean, c_addr, c_city, c_city_norm, c_state, c_pin, c_pin_clean))
+
+            with self._get_conn() as conn:
+                conn.executemany("""
+                    INSERT OR REPLACE INTO iqvia_chemists_master 
+                    (iqvia_id, chem_name, chem_name_clean, chem_address, chem_city, chem_city_norm, chem_state, chem_pincode, chem_pincode_clean)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, records)
+                conn.commit()
+            logger.info(f"[✓] Successfully indexed {len(records)} IQVIA master chemists into SQLite.")
+        except Exception as e:
+            logger.error(f"Failed to ingest Chemist master file: {e}")
+
+    def get_total_count(self) -> int:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM iqvia_chemists_master")
+            row = cur.fetchone()
+            return row[0] if row else 0
+
+    def clean_name(self, name: str) -> str:
+        if not name:
+            return ""
+        text = str(name).lower()
+        stopwords = [
+            "medical", "stores", "store", "chemist", "chemists", "pharmacy", "pharmacies",
+            "druggist", "druggists", "medicos", "medico", "generic", "aadhaar", "dawakhana",
+            "pharma", "dispensing", "enterprises", "agency", "distributor"
+        ]
+        for sw in stopwords:
+            text = re.sub(rf"\b{sw}\b", " ", text)
+        text = re.sub(r"[^a-z0-9\s]", " ", text)
+        return " ".join(text.split())
+
+    def resolve_pharmacy(
+        self,
+        pharmacy_name: str,
+        pharmacy_address: str = "",
+        pharmacy_pincode: str = "",
+        pharmacy_city: str = "",
+        threshold: float = 0.60
+    ) -> Dict[str, Any]:
+        """
+        Resolves a Google Places pharmacy against IQVIA master chemists in SQLite.
+        Uses indexed pincode/city partitioning and multi-feature similarity scoring.
+        """
+        pin_clean = ""
+        if pharmacy_pincode:
+            m = re.search(r"(\d{6})", str(pharmacy_pincode))
+            if m:
+                pin_clean = m.group(1)
+
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            rows = []
+            if pin_clean:
+                cur.execute("""
+                    SELECT iqvia_id, chem_name, chem_name_clean, chem_address, chem_city, chem_state, chem_pincode 
+                    FROM iqvia_chemists_master WHERE chem_pincode_clean = ?
+                """, (pin_clean,))
+                rows = cur.fetchall()
+
+            if not rows and pharmacy_city:
+                city_clean = re.sub(r"[^a-z0-9\s]", " ", str(pharmacy_city).lower()).strip()
+                cur.execute("""
+                    SELECT iqvia_id, chem_name, chem_name_clean, chem_address, chem_city, chem_state, chem_pincode 
+                    FROM iqvia_chemists_master WHERE chem_city_norm = ? LIMIT 200
+                """, (city_clean,))
+                rows = cur.fetchall()
+
+        if not rows:
+            return {
+                "iqvia_id": "UNMATCHED",
+                "iqvia_chem_name": "",
+                "iqvia_chem_address": "",
+                "iqvia_chem_city": "",
+                "iqvia_chem_state": "",
+                "iqvia_chem_pincode": "",
+                "iqvia_match_status": "UNMATCHED",
+                "iqvia_match_score": 0.0,
+                "iqvia_match_method": "NO_LOCAL_CANDIDATES"
+            }
+
+        p_name_clean = self.clean_name(pharmacy_name)
+        p_name_raw = re.sub(r"[^a-z0-9\s]", " ", str(pharmacy_name).lower()).strip()
+        p_tokens = set(p_name_clean.split())
+
+        p_addr_tokens = set(re.sub(r"[^a-z0-9\s]", " ", str(pharmacy_address).lower()).split()) - {
+            "road", "rd", "near", "opp", "opposite", "street", "st", "shop", "floor", "no",
+            "nagar", "colony", "complex", "market", "bhiwandi", "mumbai", "kolkata", "delhi", "india", "pincode"
+        }
+
+        best_score = 0.0
+        best_row = None
+        best_method = "NO_MATCH"
+
+        for r in rows:
+            iq_id, c_name, c_name_clean_db, c_addr, c_city, c_state, c_pincode = r
+            c_name_clean = self.clean_name(c_name)
+            c_name_raw = re.sub(r"[^a-z0-9\s]", " ", str(c_name).lower()).strip()
+            c_tokens = set(c_name_clean.split())
+
+            # 1. Exact raw / cleaned match
+            if p_name_raw and p_name_raw == c_name_raw:
+                score, method = 1.0, "EXACT_RAW_NAME"
+            elif p_name_clean and p_name_clean == c_name_clean:
+                score, method = 0.98, "EXACT_CLEANED_NAME"
+            elif p_tokens and c_tokens and p_tokens == c_tokens:
+                score, method = 0.95, "TOKEN_PERMUTATION"
+            elif p_tokens and c_tokens and p_tokens.issubset(c_tokens):
+                score, method = 0.92, "TOKEN_SUBSET"
+            elif p_tokens and c_tokens and c_tokens.issubset(p_tokens):
+                score, method = 0.90, "TOKEN_CONTAINED"
+            else:
+                seq_ratio = SequenceMatcher(None, p_name_clean, c_name_clean).ratio() if (p_name_clean and c_name_clean) else 0
+                if seq_ratio >= 0.70:
+                    score, method = round(seq_ratio, 3), "FUZZY_NAME_SIMILARITY"
+                else:
+                    score, method = round(seq_ratio, 3), "LOW_SIMILARITY"
+
+            # Address overlap boost
+            if p_addr_tokens and c_addr:
+                c_addr_tokens = set(re.sub(r"[^a-z0-9\s]", " ", str(c_addr).lower()).split())
+                common_addr = p_addr_tokens.intersection(c_addr_tokens)
+                if len(common_addr) >= 2:
+                    if score >= 0.45:
+                        score = min(1.0, score + 0.20)
+                        method += f"_ADDR_BOOST_{len(common_addr)}"
+                    elif len(common_addr) >= 3:
+                        score = max(score, 0.75)
+                        method = f"STRONG_ADDRESS_OVERLAP_{len(common_addr)}"
+
+            if score > best_score:
+                best_score = score
+                best_row = r
+                best_method = method
+
+        if best_row and best_score >= threshold:
+            iq_id, c_name, _, c_addr, c_city, c_state, c_pincode = best_row
+            status = "EXACT_MATCH" if best_score >= 0.90 else ("HIGH_CONFIDENCE" if best_score >= 0.75 else "MEDIUM_CONFIDENCE")
+            return {
+                "iqvia_id": iq_id,
+                "iqvia_chem_name": c_name,
+                "iqvia_chem_address": c_addr,
+                "iqvia_chem_city": c_city,
+                "iqvia_chem_state": c_state,
+                "iqvia_chem_pincode": c_pincode,
+                "iqvia_match_status": status,
+                "iqvia_match_score": round(best_score, 3),
+                "iqvia_match_method": best_method
+            }
+        else:
+            return {
+                "iqvia_id": "UNMATCHED",
+                "iqvia_chem_name": "",
+                "iqvia_chem_address": "",
+                "iqvia_chem_city": "",
+                "iqvia_chem_state": "",
+                "iqvia_chem_pincode": "",
+                "iqvia_match_status": "UNMATCHED",
+                "iqvia_match_score": round(best_score, 3) if best_row else 0.0,
+                "iqvia_match_method": best_method
+            }
 
 
 # ---------------------------------------------------------
@@ -1020,16 +1265,16 @@ def get_adaptive_radius_steps(base_radius: int = 300, max_radius: int = 10000) -
 
 # ---------------------------------------------------------
 # Core Matching Engine with Adaptive Search
-# ---------------------------------------------------------
 def find_top_pharmacies_for_doctor(
     doc_row: pd.Series,
     client: GoogleMapsClient,
+    chemist_master: Optional[ChemistMasterManager] = None,
     base_radius: int = 300,
     max_radius: int = 10000,
     target_count: int = 5,
     mode: str = "walking"
 ) -> List[Dict[str, Any]]:
-    """Finds and ranks top pharmacies for a single doctor using multi-tier smart adaptive radius."""
+    """Finds and ranks top pharmacies for a single doctor using multi-tier smart adaptive radius and resolves IQVIA IDs."""
     doc_id = str(doc_row.get("Doc ID", ""))
     doc_name = clean_extracted_name(str(doc_row.get("DOCTOR NAME", "")))
     doc_address = clean_extracted_name(str(doc_row.get("Address", "")))
@@ -1086,7 +1331,7 @@ def find_top_pharmacies_for_doctor(
     ranked_candidates.sort(key=lambda x: x.get("road_distance_meters", 999999))
     top_matched = ranked_candidates[:target_count]
 
-    # 6. Format Structured Records
+    # 6. Format Structured Records & Resolve IQVIA Chemist Master IDs
     matched_records = []
     for rank_idx, pharm in enumerate(top_matched, 1):
         pharm_name = clean_extracted_name(pharm.get("name", "Unknown Pharmacy"))
@@ -1100,6 +1345,26 @@ def find_top_pharmacies_for_doctor(
         place_id = pharm.get("place_id", "")
         gmaps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(pharm_name)}&query_place_id={place_id}" if place_id else f"https://maps.google.com/?q={quote_plus(pharm_name + ' ' + pharm_address)}"
 
+        # Resolve against IQVIA master if manager provided
+        iq_info = {
+            "iqvia_id": "UNMATCHED",
+            "iqvia_chem_name": "",
+            "iqvia_chem_address": "",
+            "iqvia_chem_city": "",
+            "iqvia_chem_state": "",
+            "iqvia_chem_pincode": "",
+            "iqvia_match_status": "UNMATCHED",
+            "iqvia_match_score": 0.0,
+            "iqvia_match_method": "NOT_CONFIGURED"
+        }
+        if chemist_master:
+            iq_info = chemist_master.resolve_pharmacy(
+                pharmacy_name=pharm_name,
+                pharmacy_address=pharm_address,
+                pharmacy_pincode=p_pincode,
+                pharmacy_city=p_city
+            )
+
         record = {
             "Doc ID": doc_id,
             "Doctor Name": doc_name,
@@ -1108,7 +1373,16 @@ def find_top_pharmacies_for_doctor(
             "Doctor City": doc_city,
             "Doctor Lat": origin_lat,
             "Doctor Lng": origin_lng,
+            "Rank": rank_idx,
             "Pharmacy Rank": rank_idx,
+            "IQVIA ID": iq_info.get("iqvia_id", "UNMATCHED"),
+            "IQVIA Chemist Name": iq_info.get("iqvia_chem_name", ""),
+            "IQVIA Chemist Address": iq_info.get("iqvia_chem_address", ""),
+            "IQVIA Chemist Pincode": iq_info.get("iqvia_chem_pincode", ""),
+            "IQVIA Chemist City": iq_info.get("iqvia_chem_city", ""),
+            "IQVIA Chemist State": iq_info.get("iqvia_chem_state", ""),
+            "IQVIA Match Status": iq_info.get("iqvia_match_status", "UNMATCHED"),
+            "IQVIA Match Score": iq_info.get("iqvia_match_score", 0.0),
             "Pharmacy Name": pharm_name,
             "Pharmacy Address": pharm_address,
             "Pharmacy Address (No Plus Code)": pharm_address_no_plus,
@@ -1116,6 +1390,7 @@ def find_top_pharmacies_for_doctor(
             "Pharmacy City": p_city,
             "Pharmacy Distance (meters)": dist_meters,
             "Pharmacy Distance (km)": dist_km,
+            "Walking Time": travel_time,
             "Travel Time": travel_time,
             "Google Maps URL": gmaps_url,
             "Place ID": place_id
@@ -1131,6 +1406,7 @@ def find_top_pharmacies_for_doctor(
 def process_doctor_file(
     input_file: str = "data/All_doctors.xlsx",
     output_excel: str = "output/final_doctor_nearest_5_chemists.xlsx",
+    chemist_master_path: str = "Chemist_HCM.xlsx",
     api_key: str = "",
     limit: Optional[int] = None,
     base_radius: int = 300,
@@ -1160,6 +1436,7 @@ def process_doctor_file(
     logger.info(f"Starting Doctor-Pharmacy Matching Pipeline...")
     logger.info(f"Input File: {input_file}")
     logger.info(f"Output File: {output_excel}")
+    logger.info(f"Chemist Master: {chemist_master_path}")
     logger.info(f"Search Strategy: Smart Adaptive (Base: {base_radius}m -> Max: {max_radius}m, Target: {target_count}, Mode: {mode})")
 
     # Read Input
@@ -1172,6 +1449,7 @@ def process_doctor_file(
 
     cache = CacheManager()
     client = GoogleMapsClient(api_key=api_key, cache=cache)
+    chemist_master = ChemistMasterManager(excel_path=chemist_master_path, db_path="cache.db")
 
     all_matched_records = []
     os.makedirs("checkpoints", exist_ok=True)
@@ -1187,6 +1465,7 @@ def process_doctor_file(
         matches = find_top_pharmacies_for_doctor(
             doc_row=doc_row,
             client=client,
+            chemist_master=chemist_master,
             base_radius=base_radius,
             max_radius=max_radius,
             target_count=target_count,
@@ -1195,7 +1474,8 @@ def process_doctor_file(
         
         if matches:
             all_matched_records.extend(matches)
-            logger.info(f"   -> Found {len(matches)} pharmacies (Closest: {matches[0]['Pharmacy Name']} at {matches[0]['Pharmacy Distance (meters)']}m)")
+            top_iqvia = matches[0].get("IQVIA ID", "UNMATCHED")
+            logger.info(f"   -> Found {len(matches)} pharmacies (Closest: {matches[0]['Pharmacy Name']} [IQVIA: {top_iqvia}] at {matches[0]['Pharmacy Distance (meters)']}m)")
         else:
             logger.warning(f"   -> No pharmacies matched for {doc_id}")
 
@@ -1208,6 +1488,20 @@ def process_doctor_file(
     # ---------------------------------------------------------
     df_long = pd.DataFrame(all_matched_records)
     
+    # Reorder Long format columns logically
+    preferred_long_cols = [
+        "Doc ID", "Doctor Name", "Doctor Address", "Doctor Pincode", "Doctor City",
+        "Rank", "IQVIA ID", "IQVIA Chemist Name", "IQVIA Chemist Address", "IQVIA Chemist Pincode",
+        "IQVIA Chemist City", "IQVIA Chemist State", "IQVIA Match Status", "IQVIA Match Score",
+        "Pharmacy Name", "Pharmacy Address", "Pharmacy Address (No Plus Code)", "Pharmacy Pincode",
+        "Pharmacy City", "Pharmacy Distance (meters)", "Pharmacy Distance (km)", "Walking Time",
+        "Google Maps URL"
+    ]
+    if not df_long.empty:
+        existing_cols = [c for c in preferred_long_cols if c in df_long.columns]
+        extra_cols = [c for c in df_long.columns if c not in preferred_long_cols]
+        df_long = df_long[existing_cols + extra_cols]
+
     # Build Wide Summary Table (1 row per doctor)
     wide_rows = []
     for _, doc_row in df_doctors.iterrows():
@@ -1229,17 +1523,23 @@ def process_doctor_file(
         for rank in range(1, target_count + 1):
             if rank <= len(doc_matches):
                 m = doc_matches[rank - 1]
+                row_dict[f"Pharmacy_{rank}_IQVIA_ID"] = m.get("IQVIA ID", "UNMATCHED")
                 row_dict[f"Pharmacy_{rank}_Name"] = m["Pharmacy Name"]
+                row_dict[f"Pharmacy_{rank}_IQVIA_Name"] = m.get("IQVIA Chemist Name", "")
                 row_dict[f"Pharmacy_{rank}_Address"] = m["Pharmacy Address"]
                 row_dict[f"Pharmacy_{rank}_Address_No_Plus_Code"] = m.get("Pharmacy Address (No Plus Code)", remove_plus_codes(m.get("Pharmacy Address", "")))
                 row_dict[f"Pharmacy_{rank}_Pincode"] = m["Pharmacy Pincode"]
                 row_dict[f"Pharmacy_{rank}_City"] = m["Pharmacy City"]
                 row_dict[f"Pharmacy_{rank}_Distance_meters"] = m["Pharmacy Distance (meters)"]
                 row_dict[f"Pharmacy_{rank}_Distance_km"] = m["Pharmacy Distance (km)"]
-                row_dict[f"Pharmacy_{rank}_Travel_Time"] = m["Travel Time"]
+                row_dict[f"Pharmacy_{rank}_Travel_Time"] = m.get("Walking Time", m.get("Travel Time", ""))
+                row_dict[f"Pharmacy_{rank}_Match_Status"] = m.get("IQVIA Match Status", "UNMATCHED")
+                row_dict[f"Pharmacy_{rank}_Match_Score"] = m.get("IQVIA Match Score", 0.0)
                 row_dict[f"Pharmacy_{rank}_URL"] = m["Google Maps URL"]
             else:
+                row_dict[f"Pharmacy_{rank}_IQVIA_ID"] = "N/A"
                 row_dict[f"Pharmacy_{rank}_Name"] = "N/A"
+                row_dict[f"Pharmacy_{rank}_IQVIA_Name"] = "N/A"
                 row_dict[f"Pharmacy_{rank}_Address"] = "N/A"
                 row_dict[f"Pharmacy_{rank}_Address_No_Plus_Code"] = "N/A"
                 row_dict[f"Pharmacy_{rank}_Pincode"] = "N/A"
@@ -1247,6 +1547,8 @@ def process_doctor_file(
                 row_dict[f"Pharmacy_{rank}_Distance_meters"] = "N/A"
                 row_dict[f"Pharmacy_{rank}_Distance_km"] = "N/A"
                 row_dict[f"Pharmacy_{rank}_Travel_Time"] = "N/A"
+                row_dict[f"Pharmacy_{rank}_Match_Status"] = "N/A"
+                row_dict[f"Pharmacy_{rank}_Match_Score"] = "N/A"
                 row_dict[f"Pharmacy_{rank}_URL"] = "N/A"
                 
         wide_rows.append(row_dict)
@@ -1294,6 +1596,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find closest pharmacies per doctor using Google Maps API")
     parser.add_argument("--input", default="data/All_doctors.xlsx", help="Path to input Excel file (default: data/All_doctors.xlsx)")
     parser.add_argument("--output", default="output/final_doctor_nearest_5_chemists.xlsx", help="Path to output Excel file (default: output/final_doctor_nearest_5_chemists.xlsx)")
+    parser.add_argument("--chemist-master", default="Chemist_HCM.xlsx", help="Path to master chemist dataset (default: Chemist_HCM.xlsx)")
     parser.add_argument("--key", default="", help="Google Maps API Key (optional, defaults to .env)")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit for testing (e.g. --limit 5)")
     parser.add_argument("--radius", type=int, default=300, help="Initial search radius in meters (default: 300)")
@@ -1308,6 +1611,7 @@ if __name__ == "__main__":
     process_doctor_file(
         input_file=args.input,
         output_excel=args.output,
+        chemist_master_path=args.chemist_master,
         api_key=api_key,
         limit=args.limit,
         base_radius=args.radius,

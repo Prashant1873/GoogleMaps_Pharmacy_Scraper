@@ -725,6 +725,8 @@ def run_reverse_verification_test(
             col_map["doc_city"] = col
         elif "doctor" in c_l and "pin" in c_l:
             col_map["doc_pincode"] = col
+        elif "iqvia" in c_l and "id" in c_l:
+            col_map["iqvia_id"] = col
         elif "pharmacy" in c_l and "name" in c_l:
             col_map["pharm_name"] = col
         elif "pharmacy" in c_l and "address" in c_l and "no plus" not in c_l:
@@ -758,6 +760,7 @@ def run_reverse_verification_test(
         doc_city = clean_text(str(row.get(col_map.get("doc_city", "Doctor City"), "")))
         doc_pin = str(row.get(col_map.get("doc_pincode", "Doctor Pincode"), "")).replace(".0", "")
 
+        iqvia_id = str(row.get(col_map.get("iqvia_id", "IQVIA ID"), "UNMATCHED"))
         pharm_name = clean_text(str(row.get(col_map.get("pharm_name", "Pharmacy Name"), "")))
         pharm_address = clean_text(str(row.get(col_map.get("pharm_address", "Pharmacy Address"), "")))
         pharm_city = clean_text(str(row.get(col_map.get("pharm_city", "Pharmacy City"), doc_city)))
@@ -776,7 +779,7 @@ def run_reverse_verification_test(
         except Exception:
             dynamic_radius = search_radius
 
-        logger.info(f"[{sample_num}/{actual_sample_size}] Checking Doctor '{doc_name}' ({doc_id}) <-> Pharmacy '{pharm_name}'...")
+        logger.info(f"[{sample_num}/{actual_sample_size}] Checking Doctor '{doc_name}' ({doc_id}) <-> Pharmacy '{pharm_name}' [IQVIA: {iqvia_id}]...")
 
         # 1. Geocode Pharmacy Coordinates
         pharm_geo = engine.geocode_pharmacy(pharm_name, pharm_address, pharm_city, pharm_pin, place_id)
@@ -787,6 +790,7 @@ def run_reverse_verification_test(
                 "Doc_ID": doc_id,
                 "Expected_Doctor_Name": doc_name,
                 "Expected_Doctor_Address": doc_address,
+                "IQVIA_ID": iqvia_id,
                 "Pharmacy_Name": pharm_name,
                 "Pharmacy_Address": pharm_address,
                 "Pharmacy_City": pharm_city,
@@ -876,6 +880,7 @@ def run_reverse_verification_test(
                 "Doc_ID": doc_id,
                 "Expected_Doctor_Name": doc_name,
                 "Expected_Doctor_Address": doc_address,
+                "IQVIA_ID": iqvia_id,
                 "Pharmacy_Name": pharm_name,
                 "Pharmacy_Address": pharm_address,
                 "Pharmacy_City": pharm_city,
@@ -894,6 +899,7 @@ def run_reverse_verification_test(
                 "Doc_ID": doc_id,
                 "Expected_Doctor_Name": doc_name,
                 "Expected_Doctor_Address": doc_address,
+                "IQVIA_ID": iqvia_id,
                 "Pharmacy_Name": pharm_name,
                 "Pharmacy_Address": pharm_address,
                 "Pharmacy_City": pharm_city,
